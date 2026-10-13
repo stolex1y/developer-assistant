@@ -137,7 +137,7 @@ jobs:
           restore-keys: |
             d32-review-${{ runner.os }}-${{ github.repository }}-${{ inputs.utility_ref }}-
 
-      - name: Copy trusted utility outside the PR workspace
+      - name: Export trusted utility without Git metadata
         shell: bash
         env:
           UTILITY_SHA: ${{ inputs.utility_ref }}
@@ -149,8 +149,8 @@ jobs:
             exit 1
           }
           install -d "$RUNNER_TEMP/developer-assistant"
-          cp -a "$GITHUB_WORKSPACE/.assistant/." "$RUNNER_TEMP/developer-assistant/"
-          rm -f "$RUNNER_TEMP/developer-assistant/.git"
+          git -C "$GITHUB_WORKSPACE/.assistant" archive "$UTILITY_SHA" |
+            tar -x -C "$RUNNER_TEMP/developer-assistant"
 
       - name: Build trusted review utility
         working-directory: ${{ runner.temp }}/developer-assistant
