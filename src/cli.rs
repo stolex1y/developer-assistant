@@ -12,8 +12,14 @@ pub struct Cli {
     #[arg(long, global = true, default_value = ".")]
     pub project_root: PathBuf,
 
+    #[arg(long, global = true, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    #[arg(long, global = true, value_name = "PROVIDER/MODEL")]
+    pub model: Option<String>,
+
     #[command(subcommand)]
-    pub command: Action,
+    pub command: Option<Action>,
 }
 
 #[derive(Debug, Subcommand)]

@@ -79,7 +79,10 @@ pub async fn serve_stdio(project_root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub async fn read_project_context(project_root: &Path) -> Result<ProjectContext> {
+pub async fn read_project_context<'a>(
+    project_root: &Path,
+    provider_key_env_names: impl IntoIterator<Item = &'a str>,
+) -> Result<ProjectContext> {
     let executable =
         std::env::current_exe().context("Не удалось определить путь CLI executable.")?;
     let mut command = Command::new(executable);
@@ -90,6 +93,9 @@ pub async fn read_project_context(project_root: &Path) -> Result<ProjectContext>
         .env_remove("DEVELOPER_ASSISTANT_API_KEY")
         .env_remove("DEVELOPER_ASSISTANT_BASE_URL")
         .env_remove("DEVELOPER_ASSISTANT_MODEL");
+    for env_name in provider_key_env_names {
+        command.env_remove(env_name);
+    }
     let client = ()
         .serve(
             TokioChildProcess::new(command)

@@ -3,4 +3,5 @@ pub mod cli;
 pub mod config;
 pub mod mcp;
 pub mod provider;
+pub mod repl;
 pub mod retrieval;

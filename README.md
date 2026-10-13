@@ -1,49 +1,88 @@
 # Ассистент разработчика
 
-Локальный read-only CLI отвечает на вопросы о структуре проекта по его
-`README.md` и Markdown-документам в `docs/`. Актуальные Git branch и список
-путей поступают через локальный MCP server.
+Локальный read-only CLI отвечает на вопросы о структуре проекта по корневому
+`README.md` и Markdown-документам в `docs/`. Текущая Git-ветка и список путей
+поступают через локальный MCP server.
 
 ## Требования
 
 - Rust 1.89 или новее;
 - Git в `PATH`;
-- доступ к выбранному OpenAI-compatible Chat Completions provider.
+- API key и доступ к OpenAI-compatible Chat Completions provider для ответов модели.
 
-## Настройка provider
+## Настройка providers и моделей
 
-Ключ обязателен и читается только из окружения. По умолчанию используются
-OpenAI API и модель `gpt-4o-mini`:
+Пример `config.example.toml` задаёт DeepSeek и две модели. Скопируйте его в
+пользовательский каталог и передайте ключ через окружение:
 
 ```bash
-export DEVELOPER_ASSISTANT_API_KEY='ваш-ключ'
-# Необязательно:
-export DEVELOPER_ASSISTANT_BASE_URL='https://api.openai.com/v1'
-export DEVELOPER_ASSISTANT_MODEL='gpt-4o-mini'
+mkdir -p ~/.config/developer-assistant
+cp -n config.example.toml ~/.config/developer-assistant/config.toml
+export DEEPSEEK_API_KEY='ваш-ключ'
 ```
 
-`DEVELOPER_ASSISTANT_BASE_URL` — base URL, к которому CLI добавляет
-`/chat/completions`. Remote HTTP endpoints без TLS запрещены; HTTP разрешён только
-для loopback fake provider. Redirects не выполняются. CLI не читает `.env` и не
-сохраняет ключ.
+По умолчанию CLI читает `~/.config/developer-assistant/config.toml`. Другой
+путь можно передать через `--config <путь>`. Config хранит base URL, список
+разрешённых model IDs и имя переменной окружения `api_key_env`, но не значение
+ключа. Для каждого provider можно задать отдельную переменную. Модели берутся
+только из конфигурации; сетевого автообнаружения нет.
 
-## Запуск
+DeepSeek endpoint и model IDs сверены с [официальной спецификацией Chat Completions](https://api-docs.deepseek.com/api/create-chat-completion) и [историей обновлений моделей](https://api-docs.deepseek.com/updates).
 
-Из этого репозитория:
+Для нового provider добавьте его в TOML:
 
-```bash
-cargo run -- --project-root /path/to/project /help "Какие модули есть и где находится web entry point?"
+```toml
+[providers.example]
+base_url = "https://api.example.com/v1"
+api_key_env = "EXAMPLE_API_KEY"
+models = ["model-a", "model-b"]
+
+[selection]
+default_model = "example/model-a"
 ```
 
-После `cargo build --release`:
+Удалённый endpoint должен использовать HTTPS. HTTP разрешён только для loopback
+fake provider в тестах. Redirects не выполняются.
+
+Если config отсутствует, приложение всё равно запускает REPL. `/models` покажет
+пустой список, путь config и `config.example.toml`; файл автоматически не
+создаётся. Пока нет выбранной настроенной модели, `/help` не вызывает provider.
+
+## Запуск и команды
+
+Откройте REPL для текущего Git-проекта:
 
 ```bash
-target/release/developer-assistant --project-root /path/to/project /help "Как устроена структура проекта?"
+cargo run -- --project-root /path/to/project
 ```
 
 Если `--project-root` пропущен, используется текущая директория. Она должна быть
-корнем Git working tree. Команда `/help` принимает вопрос целиком; CLI выводит
-ответ, текущую ветку, ограниченный список файлов и источники с заголовками.
+корнем Git working tree. Команды REPL:
+
+```text
+/models
+/model deepseek/deepseek-v4-pro
+/model default deepseek/deepseek-v4-pro
+/help Какие модули есть и где находится web entry point?
+/exit
+```
+
+`/model <provider>/<model>` меняет модель только для текущей сессии.
+`/model default <provider>/<model>` сохраняет default в user config и выбирает
+эту модель в текущей сессии. `--model <provider>/<model>` задаёт выбор только
+для запущенного процесса и не меняет сохранённый default.
+
+Одноразовый режим `/help` остаётся доступен:
+
+```bash
+cargo run -- --project-root /path/to/project \
+  --model deepseek/deepseek-flash \
+  /help "Как устроена структура проекта?"
+```
+
+После `cargo build --release` аналогичные команды запускаются через
+`target/release/developer-assistant`. `--config` и `--model` указываются до
+`/help`.
 
 ## Границы и приватность
 
@@ -54,6 +93,7 @@ target/release/developer-assistant --project-root /path/to/project /help "Как
 - MCP-инструменты доступны только для чтения: текущая ветка и не более 50
   уникальных путей из Git index (`--deduplicate`). Неотслеживаемые пути (включая
   подпадающие под `.gitignore`), содержимое файлов, diff и команды модели исключены.
+- MCP subprocess не наследует переменные окружения с ключами настроенных providers.
 - Provider получает пользовательский вопрос, найденные excerpts и branch/path
   context. Полный README, полный file tree и исходники не отправляются.
 - До retrieval удаляются значения с поддерживаемыми credential-метками после `:` или
@@ -70,9 +110,9 @@ target/release/developer-assistant --project-root /path/to/project /help "Как
 - Перед выводом экранируются terminal controls и bidi-direction marks в ответе,
   Git branch, путях и source headings; обычные переводы строки в ответе сохраняются.
 
-Фиксированный API contract: OpenAI-compatible `POST /chat/completions`, модель по
-умолчанию `gpt-4o-mini`, `temperature=0`, `max_completion_tokens=800`. Другую
-совместимую base URL/model можно задать переменными окружения.
+Provider contract: OpenAI-compatible `POST /chat/completions`, `temperature=0`,
+`max_tokens=800`, timeout 60 секунд. DeepSeek profile в `config.example.toml`
+использует официальный base URL и model IDs `deepseek-flash` и `deepseek-v4-pro`.
 
 ## Проверки
 

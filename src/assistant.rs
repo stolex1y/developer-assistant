@@ -1,5 +1,5 @@
 use crate::{
-    config::ProviderConfig,
+    config::UserConfig,
     mcp::{self, FileInventory, ProjectContext},
     provider,
     retrieval::{RetrievedPassage, load_corpus, retrieve},
@@ -24,22 +24,30 @@ pub struct SourceReference {
     pub heading: String,
 }
 
-pub async fn answer_question(project_root: &Path, question: &str) -> Result<HelpResult> {
+pub async fn answer_question(
+    project_root: &Path,
+    question: &str,
+    config: &UserConfig,
+    selected_model: Option<&str>,
+) -> Result<HelpResult> {
     if question.trim().is_empty() {
         bail!("Передайте вопрос после команды /help.");
     }
     let root = mcp::canonical_git_root(project_root)?;
     let corpus = load_corpus(&root)?;
     let retrieved = retrieve(&corpus, question);
-    let project = mcp::read_project_context(&root).await?;
+    let project = mcp::read_project_context(&root, config.provider_key_env_names()).await?;
 
     if retrieved.is_empty() {
         return Ok(HelpResult::NoContext { project });
     }
 
-    let config = ProviderConfig::from_env()?;
+    let selected_model = selected_model
+        .ok_or_else(|| anyhow::anyhow!("Не выбрана модель; настройте provider/model в config."))?;
+    let selection = config.resolve_model(selected_model)?;
+    let provider_config = selection.provider_config()?;
     let user_prompt = build_user_prompt(question, &project, &retrieved);
-    let text = provider::complete(&config, SYSTEM_PROMPT, &user_prompt).await?;
+    let text = provider::complete(&provider_config, SYSTEM_PROMPT, &user_prompt).await?;
     let sources = collect_sources(&retrieved);
     Ok(HelpResult::Answer {
         text,

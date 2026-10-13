@@ -5,14 +5,14 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_COMPLETION_TOKENS: u32 = 800;
+const MAX_TOKENS: u32 = 800;
 
 #[derive(Serialize)]
 struct ChatCompletionRequest<'a> {
     model: &'a str,
     messages: [PromptMessage<'a>; 2],
     temperature: f32,
-    max_completion_tokens: u32,
+    max_tokens: u32,
 }
 
 #[derive(Serialize)]
@@ -59,7 +59,7 @@ pub async fn complete(
             },
         ],
         temperature: 0.0,
-        max_completion_tokens: MAX_COMPLETION_TOKENS,
+        max_tokens: MAX_TOKENS,
     };
 
     let response = client

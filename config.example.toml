@@ -1,0 +1,8 @@
+# Ключ API берётся из переменной окружения, указанной в api_key_env.
+[providers.deepseek]
+base_url = "https://api.deepseek.com"
+api_key_env = "DEEPSEEK_API_KEY"
+models = ["deepseek-flash", "deepseek-v4-pro"]
+
+[selection]
+default_model = "deepseek/deepseek-flash"
