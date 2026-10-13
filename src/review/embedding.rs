@@ -38,7 +38,7 @@ impl Embedder for FastEmbedder {
 
         let embeddings = self
             .model
-            .embed(texts.to_vec(), None)
+            .embed(texts, None)
             .context("Не удалось вычислить локальные text embeddings.")?;
         if embeddings.len() != texts.len() {
             bail!("Embedding runtime вернул неверное число vectors.");

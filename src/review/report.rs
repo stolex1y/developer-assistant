@@ -186,7 +186,7 @@ pub fn render_summary(report: &ReviewReport, head_sha: &str) -> Result<String> {
     ] {
         output.push_str("\n## ");
         output.push_str(category.heading());
-        output.push_str("\n");
+        output.push('\n');
         let mut found = false;
         for finding in report
             .findings
