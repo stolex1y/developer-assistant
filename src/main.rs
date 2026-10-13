@@ -60,11 +60,13 @@ async fn run() -> anyhow::Result<()> {
                 &project_root,
                 &config,
                 selected_model.as_deref(),
-                &repository,
-                pr_number,
-                &base_sha,
-                &head_sha,
-                max_uncached_input_tokens,
+                ReviewInvocation {
+                    repository,
+                    pr_number,
+                    base_sha,
+                    head_sha,
+                    max_uncached_input_tokens,
+                },
             )
             .await
         }
@@ -73,16 +75,27 @@ async fn run() -> anyhow::Result<()> {
     }
 }
 
+struct ReviewInvocation {
+    repository: String,
+    pr_number: u64,
+    base_sha: String,
+    head_sha: String,
+    max_uncached_input_tokens: u64,
+}
+
 async fn run_review(
     project_root: &Path,
     config: &UserConfig,
     selected_model: Option<&str>,
-    repository: &str,
-    pr_number: u64,
-    base_sha: &str,
-    head_sha: &str,
-    max_uncached_input_tokens: u64,
+    invocation: ReviewInvocation,
 ) -> anyhow::Result<()> {
+    let ReviewInvocation {
+        repository,
+        pr_number,
+        base_sha,
+        head_sha,
+        max_uncached_input_tokens,
+    } = invocation;
     if max_uncached_input_tokens == 0 {
         bail!("Лимит uncached input tokens должен быть больше нуля.");
     }
@@ -113,11 +126,11 @@ async fn run_review(
         owner: owner.to_owned(),
         repository: repository_name.to_owned(),
         number: pr_number,
-        expected_base_sha: base_sha.to_owned(),
-        expected_head_sha: head_sha.to_owned(),
+        expected_base_sha: base_sha,
+        expected_head_sha: head_sha,
     };
     identity.validate()?;
-    validate_checkout(project_root, head_sha)?;
+    validate_checkout(project_root, &identity.expected_head_sha)?;
 
     let cache_root = project_root.join(".data/developer-assistant-review");
     let embedder = FastEmbedder::load(project_root, &cache_root.join("model"))?;
