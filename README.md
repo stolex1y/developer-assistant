@@ -87,7 +87,7 @@ cargo run -- --project-root /path/to/project \
 `target/release/developer-assistant`. `--config` и `--model` указываются до
 `/help`.
 
-## Границы и приватность
+## Границы и приватность `/help`
 
 - RAG читает только корневой `README.md` и Markdown-файлы из `docs/`.
   Исходный код, `config/`, `.env`, runtime state, examples и fixtures не сканируются.
@@ -116,6 +116,49 @@ cargo run -- --project-root /path/to/project \
 Provider contract: OpenAI-compatible `POST /chat/completions`, `temperature=0`,
 `max_tokens=800`, timeout 60 секунд. DeepSeek profile в `config.example.toml`
 использует официальный base URL и model IDs `deepseek-flash` и `deepseek-v4-pro`.
+
+## Автоматическое ревью pull request
+
+Reusable workflow хранится в `.github/workflows/review.yml`; проекты подключают
+его через caller workflow, закреплённый на неизменяемом commit SHA. Сборка и
+запуск идут на `ubuntu-24.04`. Утилита компилируется из доверенного utility
+checkout вне PR workspace; исходный код PR не запускается и не изменяется.
+Fork pull requests пропускаются.
+
+Review использует отдельный filtered RAG по tracked text-документации и коду.
+Embeddings строятся локально через `fastembed-rs` 6.1.0, ONNX Runtime CPU и
+квантованную `AllMiniLML6V2Q` (около 23 МБ публичных весов); Ollama, PyTorch,
+daemon и GPU не нужны. Actions cache хранит Cargo registry, модель и
+content-validated индекс в игнорируемом `.data/developer-assistant-review`.
+Скомпилированный `target/` не кэшируется. При первом запуске runner скачивает
+зависимости и веса; для этого требуется доступ к crates.io и Hugging Face.
+
+DeepSeek получает только допустимый PR diff, отобранные passages и краткие
+предыдущие findings. Полный индекс, credentials и посторонние файлы не
+отправляются. По умолчанию caller задаёт лимит 30 000 uncached input tokens для
+tool-enabled запросов; usage финального запроса без tools показывается отдельно.
+Изменить лимит можно в `with.max_uncached_input_tokens` caller workflow.
+
+В целевом GitHub repository задайте Actions secret `DEEPSEEK_API_KEY`.
+`GITHUB_TOKEN` workflow получает автоматически с `contents: read` и
+`pull-requests: write`. Утилита запускается при `opened`, `reopened` и
+`synchronize`; результат — PR summary и обновляемые inline threads.
+
+**Граница доверия:** включайте этот workflow только для репозитория, где
+пользователям с правом менять workflows можно доверять repository secrets.
+`pull_request` может использовать caller workflow из PR merge commit; автор
+same-repository PR, которому разрешено менять `.github/workflows`, способен
+изменить и сам caller. Утилита не запускает PR source code, но эта схема не
+защищает секрет от злонамеренного редактора workflow. Fork PR не получают ключ
+и пропускаются; не предоставляйте write access недоверенным участникам.
+
+Перед реальным запуском опубликуйте utility commit и caller commit; caller
+должен ссылаться на опубликованный immutable SHA. Проверка без credentials и
+внешних API:
+
+```bash
+cargo test --locked --test review_acceptance
+```
 
 ## Проверки
 

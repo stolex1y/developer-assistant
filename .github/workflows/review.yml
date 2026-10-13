@@ -1,0 +1,185 @@
+name: Reusable AI code review
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: GitHub repository that owns the pull request.
+        required: true
+        type: string
+      pr_number:
+        description: Pull request number.
+        required: true
+        type: number
+      base_sha:
+        description: Base commit SHA from the pull_request event.
+        required: true
+        type: string
+      head_sha:
+        description: Head commit SHA from the pull_request event.
+        required: true
+        type: string
+      utility_ref:
+        description: Immutable commit SHA shared with the reusable workflow ref.
+        required: true
+        type: string
+      max_uncached_input_tokens:
+        description: Maximum uncached input tokens for tool-enabled requests.
+        required: true
+        type: number
+    secrets:
+      deepseek_api_key:
+        description: DeepSeek API key used only by the review command.
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: d32-ai-review-${{ inputs.repository }}-${{ inputs.pr_number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout reviewed PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.head_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout the pinned review utility
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: stolex1y/developer-assistant
+          ref: ${{ inputs.utility_ref }}
+          path: .assistant
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate event inputs and cache location
+        shell: bash
+        env:
+          REVIEW_REPOSITORY: ${{ inputs.repository }}
+          REVIEW_PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEW_BASE_SHA: ${{ inputs.base_sha }}
+          REVIEW_HEAD_SHA: ${{ inputs.head_sha }}
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_PR_NUMBER: ${{ github.event.pull_request.number }}
+          EXPECTED_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          UTILITY_SHA: ${{ inputs.utility_ref }}
+        run: |
+          set -euo pipefail
+
+          [[ "$REVIEW_REPOSITORY" == "$EXPECTED_REPOSITORY" ]] || {
+            echo "::error::The review repository does not match the pull_request event."
+            exit 1
+          }
+          [[ "$REVIEW_PR_NUMBER" == "$EXPECTED_PR_NUMBER" ]] || {
+            echo "::error::The pull request number does not match the event."
+            exit 1
+          }
+          [[ "$REVIEW_BASE_SHA" == "$EXPECTED_BASE_SHA" && "$REVIEW_HEAD_SHA" == "$EXPECTED_HEAD_SHA" ]] || {
+            echo "::error::The review SHAs do not match the pull_request event."
+            exit 1
+          }
+          [[ "$REVIEW_BASE_SHA" =~ ^[0-9a-f]{40}$ && "$REVIEW_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::The pull_request event contains an invalid commit SHA."
+            exit 1
+          }
+          [[ "$UTILITY_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::The reusable workflow is not pinned to a commit SHA."
+            exit 1
+          }
+
+          tracked_data="$(git -C "$GITHUB_WORKSPACE" ls-files -- .data)"
+          if [[ -n "$tracked_data" ]]; then
+            echo "::error::Tracked files under .data are not permitted for the review cache."
+            exit 1
+          fi
+          if [[ -L "$GITHUB_WORKSPACE/.data" || -L "$GITHUB_WORKSPACE/.data/developer-assistant-review" ]]; then
+            echo "::error::The review cache path must not be a symlink."
+            exit 1
+          fi
+          if [[ -e "$GITHUB_WORKSPACE/.data" && ! -d "$GITHUB_WORKSPACE/.data" ]]; then
+            echo "::error::The .data cache parent must be a directory."
+            exit 1
+          fi
+          if [[ -e "$GITHUB_WORKSPACE/.data/developer-assistant-review" && ! -d "$GITHUB_WORKSPACE/.data/developer-assistant-review" ]]; then
+            echo "::error::The review cache path must be a directory."
+            exit 1
+          fi
+          git -C "$GITHUB_WORKSPACE" check-ignore --quiet -- .data/developer-assistant-review || {
+            echo "::error::The project must ignore .data/developer-assistant-review."
+            exit 1
+          }
+          install -d "$RUNNER_TEMP/d32-cargo-home/registry" "$RUNNER_TEMP/d32-cargo-home/git"
+
+      - name: Cache trusted dependencies and local RAG data
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ${{ runner.temp }}/d32-cargo-home/registry
+            ${{ runner.temp }}/d32-cargo-home/git
+            ${{ github.workspace }}/.data/developer-assistant-review
+          key: d32-review-${{ runner.os }}-${{ github.repository }}-${{ inputs.utility_ref }}-${{ inputs.head_sha }}
+          restore-keys: |
+            d32-review-${{ runner.os }}-${{ github.repository }}-${{ inputs.utility_ref }}-
+
+      - name: Copy trusted utility outside the PR workspace
+        shell: bash
+        env:
+          UTILITY_SHA: ${{ inputs.utility_ref }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git -C "$GITHUB_WORKSPACE/.assistant" rev-parse HEAD)"
+          [[ "$actual_sha" == "$UTILITY_SHA" ]] || {
+            echo "::error::The checked out utility SHA does not match the reusable workflow."
+            exit 1
+          }
+          install -d "$RUNNER_TEMP/developer-assistant"
+          cp -a "$GITHUB_WORKSPACE/.assistant/." "$RUNNER_TEMP/developer-assistant/"
+          rm -f "$RUNNER_TEMP/developer-assistant/.git"
+
+      - name: Build trusted review utility
+        working-directory: ${{ runner.temp }}/developer-assistant
+        env:
+          CARGO_HOME: ${{ runner.temp }}/d32-cargo-home
+          CARGO_TARGET_DIR: ${{ runner.temp }}/d32-cargo-target
+        run: cargo build --locked --release
+
+      - name: Review pull request
+        working-directory: ${{ runner.temp }}/developer-assistant
+        env:
+          CARGO_HOME: ${{ runner.temp }}/d32-cargo-home
+          CARGO_TARGET_DIR: ${{ runner.temp }}/d32-cargo-target
+          GITHUB_TOKEN: ${{ github.token }}
+          DEEPSEEK_API_KEY: ${{ secrets.deepseek_api_key }}
+          REVIEW_REPOSITORY: ${{ inputs.repository }}
+          REVIEW_PR_NUMBER: ${{ inputs.pr_number }}
+          REVIEW_BASE_SHA: ${{ inputs.base_sha }}
+          REVIEW_HEAD_SHA: ${{ inputs.head_sha }}
+          MAX_UNCACHED_INPUT_TOKENS: ${{ inputs.max_uncached_input_tokens }}
+        run: |
+          set -euo pipefail
+          "$CARGO_TARGET_DIR/release/developer-assistant" \
+            --project-root "$GITHUB_WORKSPACE" \
+            --config "$RUNNER_TEMP/developer-assistant/config.example.toml" \
+            --model deepseek/deepseek-flash \
+            review \
+            --repository "$REVIEW_REPOSITORY" \
+            --pr-number "$REVIEW_PR_NUMBER" \
+            --base-sha "$REVIEW_BASE_SHA" \
+            --head-sha "$REVIEW_HEAD_SHA" \
+            --max-uncached-input-tokens "$MAX_UNCACHED_INPUT_TOKENS"
