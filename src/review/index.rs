@@ -185,6 +185,17 @@ impl<E: Embedder> ReviewIndex<E> {
         }
         Ok(output)
     }
+    pub(crate) fn contains_path(&self, path: &str) -> bool {
+        self.documents.contains_key(path)
+    }
+
+    pub(crate) fn contains_evidence(&self, path: &str, evidence: &str) -> bool {
+        !evidence.is_empty()
+            && self
+                .documents
+                .get(path)
+                .is_some_and(|document| document.text.contains(evidence))
+    }
 }
 
 fn corpus_fingerprint(documents: &[SourceDocument]) -> String {

@@ -31,4 +31,17 @@ pub enum Action {
     },
     #[command(name = "__mcp-server", hide = true)]
     McpServer,
+    #[command(name = "review", about = "Выполнить read-only AI review pull request")]
+    Review {
+        #[arg(long, value_name = "OWNER/REPO")]
+        repository: String,
+        #[arg(long, value_name = "NUMBER")]
+        pr_number: u64,
+        #[arg(long, value_name = "BASE_SHA")]
+        base_sha: String,
+        #[arg(long, value_name = "HEAD_SHA")]
+        head_sha: String,
+        #[arg(long, value_name = "TOKENS")]
+        max_uncached_input_tokens: u64,
+    },
 }

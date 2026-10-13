@@ -18,11 +18,11 @@ static SECRET_PATTERNS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
         Regex::new(r"(?im)-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----")
             .expect("fixed private-key pattern is valid"),
         Regex::new(
-            r"(?i)\b(?:gh[pousr]_[a-z0-9]{20,}|github_pat_[a-z0-9_]{20,}|sk-(?:proj-)?[a-z0-9_-]{20,}|xox[baprs]-[a-z0-9-]{20,}|akia[0-9a-z]{16}|eyj[a-z0-9_-]{15,}\.[a-z0-9_-]{15,}\.[a-z0-9_-]{15,})\b",
+            r"(?i)\b(?:AIza[a-z0-9_-]{20,}|gh[pousr]_[a-z0-9]{20,}|github_pat_[a-z0-9_]{20,}|sk-(?:proj-)?[a-z0-9_-]{20,}|xox[baprs]-[a-z0-9-]{20,}|akia[0-9a-z]{16}|eyj[a-z0-9_-]{15,}\.[a-z0-9_-]{15,}\.[a-z0-9_-]{15,})\b",
         )
         .expect("fixed token pattern is valid"),
         Regex::new(
-            r#"(?im)(?:^|[^\w])["']?(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|secret|credential)["']?\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{24,}"#,
+            r#"(?im)(?:^|[^\w])["']?(?:[\w]+[_-])*(?:api[_-]?key|client[_-]?secret|access[_-]?token|refresh[_-]?token|password|secret|credential)["']?\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{24,}"#,
         )
         .expect("fixed labelled-secret pattern is valid"),
         Regex::new(
@@ -212,7 +212,7 @@ fn is_safe_relative_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-fn is_excluded_path(path: &str) -> bool {
+pub(crate) fn is_excluded_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     let Some(file_name) = lower.rsplit('/').next() else {
         return true;
@@ -269,6 +269,6 @@ fn is_excluded_path(path: &str) -> bool {
     excluded_directory || secret_path || generated_file
 }
 
-fn contains_secret_like_value(text: &str) -> bool {
+pub(crate) fn contains_secret_like_value(text: &str) -> bool {
     SECRET_PATTERNS.iter().any(|pattern| pattern.is_match(text))
 }

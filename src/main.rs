@@ -1,10 +1,20 @@
+use anyhow::{Context, anyhow, bail};
 use clap::Parser;
 use developer_assistant::{
     assistant::{answer_question, escape_terminal_field, print_result},
     cli::{Action, Cli},
     config::UserConfig,
     mcp, repl,
+    review::{
+        deepseek::DeepSeekClient,
+        embedding::FastEmbedder,
+        github::{GitHubClient, PullRequestId},
+        index::ReviewIndex,
+        runner::{ReviewRunner, validate_checkout},
+    },
 };
+use reqwest::Url;
+use std::{env, path::Path};
 
 #[tokio::main]
 async fn main() {
@@ -39,7 +49,105 @@ async fn run() -> anyhow::Result<()> {
                 .await
                 .map(print_result)
         }
+        Some(Action::Review {
+            repository,
+            pr_number,
+            base_sha,
+            head_sha,
+            max_uncached_input_tokens,
+        }) => {
+            run_review(
+                &project_root,
+                &config,
+                selected_model.as_deref(),
+                &repository,
+                pr_number,
+                &base_sha,
+                &head_sha,
+                max_uncached_input_tokens,
+            )
+            .await
+        }
         Some(Action::McpServer) => unreachable!("MCP server path returned before config load"),
         None => repl::run(&project_root, &mut config, selected_model).await,
     }
+}
+
+async fn run_review(
+    project_root: &Path,
+    config: &UserConfig,
+    selected_model: Option<&str>,
+    repository: &str,
+    pr_number: u64,
+    base_sha: &str,
+    head_sha: &str,
+    max_uncached_input_tokens: u64,
+) -> anyhow::Result<()> {
+    if max_uncached_input_tokens == 0 {
+        bail!("Лимит uncached input tokens должен быть больше нуля.");
+    }
+    let selected_model =
+        selected_model.context("Для review задайте --model или DeepSeek default в config.")?;
+    let selection = config.resolve_model(selected_model)?;
+    if selection.provider_id() != "deepseek" {
+        bail!("AI code review в этой версии использует только provider deepseek.");
+    }
+    let provider = selection.provider_config()?;
+    let deepseek = DeepSeekClient::new(
+        provider.endpoint().clone(),
+        provider.api_key().to_owned(),
+        provider.model().to_owned(),
+    )?;
+
+    let github_token = env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("Задайте GitHub Actions token в GITHUB_TOKEN."))?;
+    let github_api = Url::parse("https://api.github.com/")?;
+    let github = GitHubClient::new(github_api, github_token)?;
+
+    let (owner, repository_name) = repository
+        .split_once('/')
+        .context("--repository должен иметь формат OWNER/REPO.")?;
+    let identity = PullRequestId {
+        owner: owner.to_owned(),
+        repository: repository_name.to_owned(),
+        number: pr_number,
+        expected_base_sha: base_sha.to_owned(),
+        expected_head_sha: head_sha.to_owned(),
+    };
+    identity.validate()?;
+    validate_checkout(project_root, head_sha)?;
+
+    let cache_root = project_root.join(".data/developer-assistant-review");
+    let embedder = FastEmbedder::load(project_root, &cache_root.join("model"))?;
+    let mut index = ReviewIndex::open(project_root, &cache_root.join("index"), embedder)?;
+    let runner = ReviewRunner::new(github, deepseek);
+    let result = runner
+        .run_with_index(
+            project_root,
+            &identity,
+            max_uncached_input_tokens,
+            &mut index,
+        )
+        .await?;
+
+    println!(
+        "Review PR #{pr_number}: files={}, findings={}, threads updated={}, threads resolved={}.",
+        result.changed_files_reviewed,
+        result.findings_published,
+        result.threads_created_or_updated,
+        result.threads_resolved
+    );
+    println!(
+        "Tool-enabled uncached input tokens: {}; tool calls: {}; provider requests: {}.",
+        result.retrieval_uncached_input_tokens, result.tool_calls_executed, result.requests
+    );
+    if let Some(usage) = result.final_usage {
+        println!(
+            "Final no-tools request usage (separate): prompt={}, cached={}, uncached={}.",
+            usage.prompt_tokens, usage.cached_input_tokens, usage.uncached_input_tokens
+        );
+    }
+    Ok(())
 }

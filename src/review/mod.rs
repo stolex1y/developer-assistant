@@ -1,5 +1,10 @@
 pub(crate) mod cache;
 pub mod corpus;
+pub mod deepseek;
 pub mod embedding;
+pub mod github;
 pub mod index;
+pub mod report;
 pub mod retrieval;
+pub mod runner;
+pub mod tools;

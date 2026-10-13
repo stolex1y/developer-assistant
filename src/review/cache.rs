@@ -24,6 +24,7 @@ pub(crate) fn prepare_cache_directory(root: &Path, requested: &Path) -> Result<P
         }
     }
     ensure_cache_is_ignored(root, relative)?;
+    ensure_cache_has_no_tracked_files(root, relative)?;
 
     let mut current = root.to_path_buf();
     for component in relative.components() {
@@ -81,4 +82,22 @@ fn ensure_cache_is_ignored(root: &Path, relative: &Path) -> Result<()> {
         Some(1) => bail!("Project cache directory должна быть исключена Git."),
         _ => bail!("Git не смог проверить исключение project cache."),
     }
+}
+
+fn ensure_cache_has_no_tracked_files(root: &Path, relative: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--cached", "-z", "--"])
+        .arg(relative)
+        .output()
+        .context("Не удалось проверить tracked files в project cache.")?;
+    if !output.status.success() {
+        bail!("Git не смог проверить содержимое project cache.");
+    }
+    if !output.stdout.is_empty() {
+        bail!("Project cache directory не может содержать tracked files.");
+    }
+    Ok(())
 }
