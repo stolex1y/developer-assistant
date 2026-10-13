@@ -13,12 +13,15 @@
 ## Настройка providers и моделей
 
 Пример `config.example.toml` задаёт DeepSeek и две модели. Скопируйте его в
-пользовательский каталог и передайте ключ через окружение:
+пользовательский каталог и введите ключ скрыто, без записи значения в историю
+команд:
 
 ```bash
 mkdir -p ~/.config/developer-assistant
 cp -n config.example.toml ~/.config/developer-assistant/config.toml
-export DEEPSEEK_API_KEY='ваш-ключ'
+read -rs -p "DeepSeek API key: " DEEPSEEK_API_KEY
+printf '\n'
+export DEEPSEEK_API_KEY
 ```
 
 По умолчанию CLI читает `~/.config/developer-assistant/config.toml`. Другой
