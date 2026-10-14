@@ -126,10 +126,11 @@ checkout вне PR workspace; исходный код PR не запускает
 Fork pull requests пропускаются.
 
 Review использует отдельный filtered RAG по tracked text-документации и коду.
-Embeddings строятся локально через `fastembed-rs` 6.1.0, ONNX Runtime CPU и
-квантованную `AllMiniLML6V2Q` (около 23 МБ публичных весов); Ollama, PyTorch,
-daemon и GPU не нужны. Actions cache хранит Cargo registry, модель и
-content-validated индекс в игнорируемом `.data/developer-assistant-review`.
+Embeddings строятся локально через `fastembed-rs` 6.1.0 и ONNX Runtime CPU на
+неквантованной `AllMiniLML6V2` (384 измерения). Batch size — 8 passages; модель
+сохраняет весь допустимый corpus, ограничивая пиковую память inference.
+Ollama, PyTorch, daemon и GPU не нужны. Actions cache хранит Cargo registry,
+модель и content-validated индекс в игнорируемом `.data/developer-assistant-review`.
 Скомпилированный `target/` не кэшируется. При первом запуске runner скачивает
 зависимости и веса; для этого требуется доступ к crates.io и Hugging Face.
 

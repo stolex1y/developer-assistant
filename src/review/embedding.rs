@@ -3,8 +3,10 @@ use anyhow::{Context, Result, bail};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use std::path::Path;
 
-pub const MODEL_ID: &str = "fastembed-6.1.0/Xenova-all-MiniLM-L6-v2-quantized-onnx";
+pub const MODEL_ID: &str = "fastembed-6.1.0/Qdrant-all-MiniLM-L6-v2-onnx";
 pub const EMBEDDING_DIMENSIONS: usize = 384;
+
+const EMBEDDING_BATCH_SIZE: usize = 8;
 
 pub trait Embedder {
     fn embed(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
@@ -20,7 +22,7 @@ impl FastEmbedder {
             .canonicalize()
             .context("Не удалось определить корень для embedding model cache.")?;
         let cache_dir = prepare_cache_directory(&root, requested_cache_dir)?;
-        let options = TextInitOptions::new(EmbeddingModel::AllMiniLML6V2Q)
+        let options = TextInitOptions::new(EmbeddingModel::AllMiniLML6V2)
             .with_cache_dir(cache_dir.to_path_buf())
             .with_show_download_progress(true)
             .with_intra_threads(2);
@@ -38,7 +40,7 @@ impl Embedder for FastEmbedder {
 
         let embeddings = self
             .model
-            .embed(texts, None)
+            .embed(texts, Some(EMBEDDING_BATCH_SIZE))
             .context("Не удалось вычислить локальные text embeddings.")?;
         if embeddings.len() != texts.len() {
             bail!("Embedding runtime вернул неверное число vectors.");
