@@ -30,7 +30,7 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
             nodes {
               databaseId
               body
-              author { login }
+              author { login __typename }
             }
           }
         }
@@ -150,6 +150,27 @@ struct ApiComment {
 #[derive(Deserialize)]
 struct ApiUser {
     login: String,
+    #[serde(rename = "type")]
+    rest_type: Option<String>,
+    #[serde(rename = "__typename")]
+    graphql_type: Option<String>,
+}
+
+impl ApiUser {
+    fn is_bot(&self) -> bool {
+        self.rest_type.as_deref() == Some("Bot") || self.graphql_type.as_deref() == Some("Bot")
+    }
+}
+
+fn reviewer_author_matches(author: &ApiUser, viewer_login: &str) -> bool {
+    if author.login == viewer_login {
+        return true;
+    }
+    author.is_bot()
+        && matches!(
+            (author.login.as_str(), viewer_login),
+            ("github-actions", "github-actions[bot]") | ("github-actions[bot]", "github-actions")
+        )
 }
 
 #[derive(Deserialize)]
@@ -327,7 +348,10 @@ impl GitHubClient {
                 let Some(comment) = thread.comments.nodes.first() else {
                     continue;
                 };
-                if comment.author.as_ref().map(|author| author.login.as_str()) != Some(viewer_login)
+                if !comment
+                    .author
+                    .as_ref()
+                    .is_some_and(|author| reviewer_author_matches(author, viewer_login))
                 {
                     continue;
                 }
@@ -381,7 +405,11 @@ impl GitHubClient {
             let url = self.issue_comments_url(identity, page)?;
             let comments: Vec<ApiComment> = self.get_json(url).await?;
             for comment in &comments {
-                if comment.user.as_ref().map(|user| user.login.as_str()) != Some(viewer_login) {
+                if !comment
+                    .user
+                    .as_ref()
+                    .is_some_and(|user| reviewer_author_matches(user, viewer_login))
+                {
                     continue;
                 }
                 let Some(body) = comment.body.as_deref() else {
@@ -772,7 +800,8 @@ async fn bounded_body(mut response: Response, limit: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PullMetadata, PullRequestId, added_line_numbers, parse_new_line_start, validate_metadata,
+        ApiUser, PullMetadata, PullRequestId, added_line_numbers, parse_new_line_start,
+        reviewer_author_matches, validate_metadata,
     };
     use serde_json::json;
 
@@ -813,6 +842,30 @@ mod tests {
         assert!(validate_metadata(&identity, &stale_base).is_err());
         let stale_head = metadata("acme/transaction-import", "b", "c");
         assert!(validate_metadata(&identity, &stale_head).is_err());
+    }
+
+    #[test]
+    fn github_actions_bot_login_variants_match_but_other_accounts_do_not() {
+        let action_bot = ApiUser {
+            login: "github-actions".to_owned(),
+            rest_type: None,
+            graphql_type: Some("Bot".to_owned()),
+        };
+        assert!(reviewer_author_matches(&action_bot, "github-actions[bot]"));
+
+        let user = ApiUser {
+            login: "github-actions".to_owned(),
+            rest_type: None,
+            graphql_type: Some("User".to_owned()),
+        };
+        assert!(!reviewer_author_matches(&user, "github-actions[bot]"));
+
+        let other_bot = ApiUser {
+            login: "review-bot[bot]".to_owned(),
+            rest_type: None,
+            graphql_type: Some("Bot".to_owned()),
+        };
+        assert!(!reviewer_author_matches(&other_bot, "review-bot"));
     }
 
     fn metadata(head_repository: &str, base_sha: &str, head_sha: &str) -> PullMetadata {

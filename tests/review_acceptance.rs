@@ -1521,7 +1521,10 @@ fn mock_github_response(request: &CapturedRequest, state: &mut MockGithubState) 
                 query.contains("viewer") && !query.contains("reviewThreads")
             }) =>
         {
-            (200, json!({"data":{"viewer":{"login":"review-bot"}}}))
+            (
+                200,
+                json!({"data":{"viewer":{"login":"github-actions[bot]"}}}),
+            )
         }
         ("GET", "/api/repos/acme/transaction-import/pulls/7") => {
             state.metadata_calls += 1;
@@ -1575,7 +1578,7 @@ fn mock_github_response(request: &CapturedRequest, state: &mut MockGithubState) 
                         json!({
                             "id":summary.comment_id,
                             "body":summary.body,
-                            "user":{"login":"review-bot"}
+                            "user":{"login":"github-actions[bot]","type":"Bot"}
                         })
                     })
                     .collect(),
@@ -1621,7 +1624,7 @@ fn mock_github_response(request: &CapturedRequest, state: &mut MockGithubState) 
                                     "comments":{"nodes":[{
                                         "databaseId":thread.comment_id,
                                         "body":thread.body,
-                                        "author":{"login":"review-bot"}
+                                        "author":{"login":"github-actions","__typename":"Bot"}
                                     }]}
                                 })).collect::<Vec<_>>(),
                                 "pageInfo":{"hasNextPage":false,"endCursor":null}
