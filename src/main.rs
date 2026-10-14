@@ -5,6 +5,7 @@ use developer_assistant::{
     cli::{Action, Cli},
     config::UserConfig,
     mcp, repl,
+    retrieval::ProjectIndex,
     review::{
         deepseek::DeepSeekClient,
         embedding::FastEmbedder,
@@ -45,9 +46,16 @@ async fn run() -> anyhow::Result<()> {
     match command {
         Some(Action::Help { question }) => {
             let question = question.join(" ");
-            answer_question(&project_root, &question, &config, selected_model.as_deref())
-                .await
-                .map(print_result)
+            let mut project_index = ProjectIndex::default();
+            answer_question(
+                &project_root,
+                &question,
+                &config,
+                selected_model.as_deref(),
+                &mut project_index,
+            )
+            .await
+            .map(print_result)
         }
         Some(Action::Review {
             repository,

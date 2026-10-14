@@ -67,12 +67,7 @@ pub struct ToolLoopResult {
     pub requests: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InputTokenUsage {
-    pub prompt_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub uncached_input_tokens: u64,
-}
+pub use crate::provider::InputTokenUsage;
 
 #[derive(Serialize)]
 struct ChatCompletionRequest<'a> {
@@ -135,7 +130,7 @@ struct FunctionCall {
 #[derive(Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<Choice>,
-    usage: Option<Usage>,
+    usage: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -149,19 +144,6 @@ struct AssistantResponse {
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
-}
-
-#[derive(Deserialize)]
-struct Usage {
-    prompt_tokens: Option<u64>,
-    prompt_tokens_details: Option<PromptTokenDetails>,
-}
-
-#[derive(Deserialize)]
-struct PromptTokenDetails {
-    prompt_cache_hit_tokens: Option<u64>,
-    prompt_cache_miss_tokens: Option<u64>,
-    cached_tokens: Option<u64>,
 }
 
 impl DeepSeekClient {
@@ -370,53 +352,8 @@ fn validate_endpoint(endpoint: &Url) -> Result<()> {
     Ok(())
 }
 
-fn valid_usage(usage: Option<Usage>) -> Result<InputTokenUsage> {
-    let usage =
-        usage.context("DeepSeek не вернул token usage; review прекращён без публикации.")?;
-    let prompt_tokens = usage
-        .prompt_tokens
-        .context("DeepSeek не вернул prompt_tokens.")?;
-    let details = usage
-        .prompt_tokens_details
-        .context("DeepSeek не вернул prompt_tokens_details.")?;
-    let cache_hit_tokens = match (details.prompt_cache_hit_tokens, details.cached_tokens) {
-        (Some(hit), Some(alias)) if hit != alias => {
-            bail!("DeepSeek вернул противоречивые cache-hit token counts.");
-        }
-        (Some(hit), _) | (_, Some(hit)) => Some(hit),
-        (None, None) => None,
-    };
-    let (cache_hit_tokens, cache_miss_tokens) = match (
-        cache_hit_tokens,
-        details.prompt_cache_miss_tokens,
-    ) {
-        (Some(hit), Some(miss)) => (hit, miss),
-        (Some(hit), None) => (
-            hit,
-            prompt_tokens
-                .checked_sub(hit)
-                .context("DeepSeek вернул cache-hit tokens больше общего prompt_tokens.")?,
-        ),
-        (None, Some(miss)) => (
-            prompt_tokens
-                .checked_sub(miss)
-                .context("DeepSeek вернул uncached tokens больше общего prompt_tokens.")?,
-            miss,
-        ),
-        (None, None) => {
-            bail!(
-                "DeepSeek не вернул cache-hit/cache-miss breakdown; review прекращён без публикации."
-            );
-        }
-    };
-    if cache_hit_tokens.checked_add(cache_miss_tokens) != Some(prompt_tokens) {
-        bail!("DeepSeek вернул противоречивый prompt token usage.");
-    }
-    Ok(InputTokenUsage {
-        prompt_tokens,
-        cached_input_tokens: cache_hit_tokens,
-        uncached_input_tokens: cache_miss_tokens,
-    })
+fn valid_usage(usage: Option<Value>) -> Result<InputTokenUsage> {
+    crate::provider::parse_input_usage(usage, "DeepSeek")
 }
 
 fn first_choice(choices: Vec<Choice>) -> Result<Choice> {

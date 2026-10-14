@@ -29,8 +29,16 @@ async fn help_uses_docs_and_live_mcp_context() {
     let (_fixture, root) = selected_project_or_fixture();
     let expected_branch = git_output(&root, &["branch", "--show-current"]);
     let before = git_output(&root, &["status", "--porcelain", "--untracked-files=all"]);
-    let response = completion_response(STRUCTURE_ANSWER);
-    let (base_url, fake_provider) = start_provider("200 OK", response).await;
+    let responses = vec![
+        tool_call_response(
+            "schema-search",
+            "search_code",
+            json!({"query": "transaction-import.v3 schema", "limit": 8}),
+            12,
+        ),
+        completion_response(STRUCTURE_ANSWER),
+    ];
+    let (base_url, fake_provider) = start_provider_script(responses).await;
 
     let output = run_cli(
         &root,
@@ -43,9 +51,9 @@ async fn help_uses_docs_and_live_mcp_context() {
         fake_provider.abort();
         panic!("CLI failed: {}", String::from_utf8_lossy(&output.stderr));
     }
-    let request = timeout(Duration::from_secs(5), fake_provider)
+    let requests = timeout(Duration::from_secs(5), fake_provider)
         .await
-        .expect("CLI did not call the local fake provider")
+        .expect("CLI did not complete the provider tool loop")
         .expect("fake provider task failed");
     let after = git_output(&root, &["status", "--porcelain", "--untracked-files=all"]);
 
@@ -59,10 +67,29 @@ async fn help_uses_docs_and_live_mcp_context() {
     assert!(stdout.contains("docs/architecture.md"));
     assert!(stdout.contains("Источники:"));
 
-    let request: Value = serde_json::from_slice(&request).expect("fake provider got valid JSON");
+    assert_eq!(requests.len(), 2);
+    let request: Value =
+        serde_json::from_slice(&requests[0].body).expect("fake provider got valid JSON");
+    let followup: Value =
+        serde_json::from_slice(&requests[1].body).expect("tool follow-up is valid JSON");
+    let search_result = followup["messages"]
+        .as_array()
+        .expect("follow-up messages exist")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("search_code result is sent back to the model");
+    assert!(search_result.contains("docs/data-api.md"));
+    assert!(search_result.contains("transaction-import.v3"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("docs/data-api.md#"));
+
     assert_eq!(request["model"], "gpt-4o-mini");
     assert_eq!(request["temperature"], 0.0);
     assert_eq!(request["max_tokens"], 800);
+    assert_eq!(request["tool_choice"], "auto");
+    assert_eq!(request["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(request["tools"][0]["function"]["name"], "search_code");
+    assert_eq!(request["tools"][1]["function"]["name"], "read_file");
     let messages = request["messages"].as_array().expect("chat messages array");
     let prompt = messages
         .iter()
@@ -73,7 +100,6 @@ async fn help_uses_docs_and_live_mcp_context() {
     assert!(prompt.contains("Пути проекта ("));
     assert!(prompt.contains("README.md"));
     assert!(prompt.contains("[docs/architecture.md#"));
-    assert!(prompt.contains("[docs/data-api.md#"));
     assert!(prompt.contains("core"));
     assert!(!prompt.contains(TEST_API_KEY));
 }
@@ -102,9 +128,395 @@ async fn help_retrieves_readme_as_a_cited_source() {
     let request: Value = serde_json::from_slice(&request).expect("fake provider got valid JSON");
     let prompt = user_prompt(&request);
 
-    assert!(prompt.contains("[README.md#Возможности]"));
+    assert!(prompt.contains("[README.md#"));
     assert!(prompt.contains("read-only trace"));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("README.md"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("README.md#"));
+    assert!(stdout.contains("Источники:"));
+}
+
+#[tokio::test]
+async fn help_read_file_returns_heading_and_prints_citable_markdown_source() {
+    let fixture = git_project_with_docs(
+        "# Overview\nThe repository has a small local interface.",
+        "# Architecture\nThe service exposes a local interface.",
+    );
+    let responses = vec![
+        tool_call_response(
+            "read-architecture",
+            "read_file",
+            json!({"path": "docs/architecture.md", "start_line": 2, "end_line": 2}),
+            12,
+        ),
+        completion_response("Интерфейс описан в архитектурной документации."),
+    ];
+    let (base_url, fake_provider) = start_provider_script(responses).await;
+
+    let output = run_cli(
+        fixture.path(),
+        "Как устроен интерфейс?",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    let requests = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("tool loop did not complete")
+        .expect("fake provider task completed");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 2);
+    let followup: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let tool_result = followup["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("read_file result is sent back to the model");
+    let payload: Value = serde_json::from_str(tool_result).unwrap();
+    assert_eq!(payload["heading"], "Architecture");
+    assert!(
+        payload["text"]
+            .as_str()
+            .unwrap()
+            .contains("The service exposes a local interface.")
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("`docs/architecture.md#Architecture` (строки 2–2)")
+    );
+}
+
+#[tokio::test]
+async fn help_preserves_large_quoted_read_file_result() {
+    let quoted = "\"".repeat(6_000);
+    let docs = format!("# Architecture\n{quoted}");
+    let fixture = git_project_with_docs("# Overview\nThe repository has a local interface.", &docs);
+    let responses = vec![
+        tool_call_response(
+            "read-quoted",
+            "read_file",
+            json!({"path": "docs/architecture.md", "start_line": 2, "end_line": 2}),
+            12,
+        ),
+        completion_response("Цитируемый фрагмент получен."),
+    ];
+    let (base_url, fake_provider) = start_provider_script(responses).await;
+
+    let output = run_cli(
+        fixture.path(),
+        "Покажи документированный пример.",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    let requests = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("tool loop did not complete")
+        .expect("fake provider task completed");
+
+    assert!(output.status.success());
+    let followup: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let tool_result = followup["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("read_file result is sent back to the model");
+    assert!(tool_result.len() > 12_000);
+    let payload: Value = serde_json::from_str(tool_result).unwrap();
+    assert_eq!(payload["path"], "docs/architecture.md");
+    assert_eq!(payload["heading"], "Architecture", "{payload}");
+    assert_eq!(payload["start_line"], 2);
+    assert_eq!(payload["end_line"], 2);
+    assert!(payload["text"].as_str().unwrap().contains(&quoted));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("`docs/architecture.md#Architecture` (строки 2–2)"),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn help_cites_only_the_lines_returned_by_read_file() {
+    let fixture = git_project_with_docs(
+        "# Overview\nThe repository has a local interface.",
+        "# Architecture\nThe service exposes a local interface.\n",
+    );
+    let responses = vec![
+        tool_call_response(
+            "read-architecture",
+            "read_file",
+            json!({"path": "docs/architecture.md", "start_line": 1, "end_line": 80}),
+            12,
+        ),
+        completion_response("Архитектура описывает интерфейс."),
+    ];
+    let (base_url, fake_provider) = start_provider_script(responses).await;
+
+    let output = run_cli(
+        fixture.path(),
+        "Как устроен интерфейс?",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    let requests = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("tool loop did not complete")
+        .expect("fake provider task completed");
+
+    assert!(output.status.success());
+    let followup: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let tool_result = followup["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("read_file result is sent back to the model");
+    let payload: Value = serde_json::from_str(tool_result).unwrap();
+    assert_eq!(payload["start_line"], 1);
+    assert_eq!(payload["end_line"], 2);
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("`docs/architecture.md#Architecture` (строки 1–2)")
+    );
+}
+
+#[tokio::test]
+async fn help_stops_tools_at_the_uncached_token_budget() {
+    let fixture = git_project_with_docs(
+        "# Configuration\nThe configured storage engine uses MEMORY_ENGINE_MARKER.",
+        "# Architecture\nThe project exposes a small local interface.",
+    );
+    let responses = vec![
+        tool_call_response(
+            "search-call",
+            "search_code",
+            json!({"query": "storage engine", "limit": 3}),
+            18_000,
+        ),
+        tool_call_response(
+            "read-call",
+            "read_file",
+            json!({"path": "README.md", "start_line": 1, "end_line": 2}),
+            12_001,
+        ),
+        completion_response("Лимит достигнут; возвращаю подтверждённые сведения."),
+    ];
+    let (base_url, fake_provider) = start_provider_script(responses).await;
+
+    let output = run_cli(
+        fixture.path(),
+        "Какой storage engine указан?",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    let requests = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("tool loop did not complete")
+        .expect("fake provider task completed");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 3);
+    let parsed = requests
+        .iter()
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(parsed[0]["tool_choice"], "auto");
+    assert_eq!(parsed[1]["tool_choice"], "auto");
+    assert_eq!(parsed[2]["tool_choice"], "none");
+    assert!(parsed[2].get("tools").is_none());
+    let final_tool_results = parsed[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect::<Vec<_>>();
+    assert_eq!(final_tool_results.len(), 2);
+    assert!(
+        final_tool_results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("MEMORY_ENGINE_MARKER")
+    );
+    assert!(
+        final_tool_results[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("input_budget_exhausted")
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("30001 uncached input tokens / 30000"));
+    assert!(stdout.contains("10 uncached input tokens; он не входит"));
+    assert!(stdout.contains("tools executed: 1"));
+}
+
+#[tokio::test]
+async fn help_has_no_fixed_tool_call_count_limit() {
+    let fixture = git_project_with_docs(
+        "# Configuration\nThe configured storage engine uses MEMORY_ENGINE_MARKER.",
+        "# Architecture\nThe project exposes a small local interface.",
+    );
+    let mut responses = (0..31)
+        .map(|index| {
+            tool_call_response(
+                &format!("search-{index}"),
+                "search_code",
+                json!({"query": format!("storage engine marker {index}"), "limit": 1}),
+                1,
+            )
+        })
+        .collect::<Vec<_>>();
+    responses.push(completion_response(
+        "Поиск завершён после нескольких уточнений.",
+    ));
+    let (base_url, fake_provider) = start_provider_script(responses).await;
+
+    let output = run_cli(
+        fixture.path(),
+        "Где описан storage engine?",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    let requests = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("tool loop did not complete 31 distinct tool calls")
+        .expect("fake provider task completed");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 32);
+    let final_request: Value =
+        serde_json::from_slice(&requests[31].body).expect("final request is JSON");
+    assert_eq!(final_request["tool_choice"], "auto");
+    assert_eq!(final_request["tools"].as_array().unwrap().len(), 2);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("41 uncached input tokens / 30000"));
+    assert!(stdout.contains("provider requests: 32, tools executed: 31"));
+}
+
+#[tokio::test]
+async fn help_refreshes_the_project_index_between_repl_questions() {
+    let fixture = git_project_with_docs(
+        "# Configuration\nThe configured storage engine uses OLD_ENGINE_MARKER.",
+        "# Architecture\nThe project exposes a local interface.",
+    );
+    let responses = vec![
+        completion_response("В первой версии использовался старый движок."),
+        completion_response("После обновления используется новый движок."),
+    ];
+    let (base_url, fake_provider) =
+        start_provider_and_update_readme(fixture.path().to_owned(), responses).await;
+    let config_directory = TempDir::new().expect("temporary config directory");
+    let config_path = config_directory.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[providers.test]\nbase_url = \"{base_url}\"\napi_key_env = \"DEVELOPER_ASSISTANT_API_KEY\"\nmodels = [\"test-model\"]\n\n[selection]\ndefault_model = \"test/test-model\"\n"
+        ),
+    )
+    .expect("provider catalog is written");
+
+    let output = run_repl(
+        fixture.path(),
+        &config_path,
+        None,
+        "/help Какой storage engine настроен?\n/help Какой storage engine настроен?\n/exit\n",
+        &[("DEVELOPER_ASSISTANT_API_KEY", TEST_API_KEY)],
+    )
+    .await;
+    let requests = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("REPL did not complete both help requests")
+        .expect("fake provider task completed");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(requests.len(), 2);
+    let first_request: Value =
+        serde_json::from_slice(&requests[0].body).expect("first request is JSON");
+    let second_request: Value =
+        serde_json::from_slice(&requests[1].body).expect("second request is JSON");
+    let first_prompt = user_prompt(&first_request);
+    let second_prompt = user_prompt(&second_request);
+    assert!(first_prompt.contains("OLD_ENGINE_MARKER"));
+    assert!(!first_prompt.contains("NEW_ENGINE_MARKER"));
+    assert!(second_prompt.contains("NEW_ENGINE_MARKER"));
+    assert!(!second_prompt.contains("OLD_ENGINE_MARKER"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("старый движок"));
+    assert!(stdout.contains("новый движок"));
+}
+
+#[tokio::test]
+async fn help_ignores_files_present_only_in_an_inherited_git_index() {
+    let fixture = git_project_with_docs(
+        "# Overview\nThe project has a local interface.",
+        "# Architecture\nThe service exposes a local interface.",
+    );
+    fs::write(
+        fixture.path().join("notes.md"),
+        "# Notes\nUNTRACKED_SENTINEL_48291\n",
+    )
+    .unwrap();
+    let alternate_index_directory = TempDir::new().expect("alternate Git index directory");
+    let alternate_index = alternate_index_directory.path().join("alternate.index");
+    let staged = StdCommand::new("git")
+        .arg("-C")
+        .arg(fixture.path())
+        .args(["add", "--", "notes.md"])
+        .env("GIT_INDEX_FILE", &alternate_index)
+        .output()
+        .expect("git is installed");
+    assert!(
+        staged.status.success(),
+        "{}",
+        String::from_utf8_lossy(&staged.stderr)
+    );
+    let (base_url, fake_provider) = start_provider(
+        "200 OK",
+        completion_response("Нет подтверждения в корпусе."),
+    )
+    .await;
+
+    let output = run_cli_with_git_index(
+        fixture.path(),
+        "Что означает число 48291?",
+        &base_url,
+        TEST_API_KEY,
+        &alternate_index,
+    )
+    .await;
+    let request = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("CLI did not call the fake provider")
+        .expect("fake provider task completed");
+    let request: Value = serde_json::from_slice(&request).expect("provider request is valid JSON");
+    let prompt = user_prompt(&request);
+
+    assert!(output.status.success());
+    assert!(!prompt.contains("UNTRACKED_SENTINEL_48291"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("notes.md"));
 }
 
 #[tokio::test]
@@ -126,8 +538,43 @@ async fn help_without_relevant_docs_skips_provider() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Ветка Git: `main`"));
-    assert!(stdout.contains("В документации нет подходящего контекста"));
+    assert!(stdout.contains("В filtered corpus нет допустимых tracked-файлов"));
     assert!(stdout.contains("provider не вызывался"));
+}
+
+#[tokio::test]
+async fn help_calls_provider_with_tools_when_initial_retrieval_has_no_match() {
+    let fixture = git_project_with_docs(
+        "# Overview\nThe project exposes a documented local interface.",
+        "# Architecture\nThe repository contains a small service.",
+    );
+    let (base_url, fake_provider) = start_provider(
+        "200 OK",
+        completion_response("В доступном корпусе нет подтверждения."),
+    )
+    .await;
+
+    let output = run_cli(
+        fixture.path(),
+        "Расскажи про qzxv-nonexistent-token.",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    let request = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("provider was not called for a nonempty corpus")
+        .expect("fake provider task completed");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request: Value = serde_json::from_slice(&request).expect("provider request is valid JSON");
+    assert_eq!(request["tool_choice"], "auto");
+    assert_eq!(request["tools"].as_array().unwrap().len(), 2);
+    assert!(user_prompt(&request).contains("Подходящих начальных фрагментов нет"));
 }
 
 #[tokio::test]
@@ -210,20 +657,20 @@ async fn mcp_file_inventory_deduplicates_unmerged_stages() {
         &["config", "user.email", "d31-test@example.invalid"],
     );
     for index in 0..48 {
-        fs::write(fixture.path().join(format!("a-{index:02}.txt")), "baseline").unwrap();
+        fs::write(fixture.path().join(format!("a-{index:02}.txt")), [0]).unwrap();
     }
-    fs::write(fixture.path().join("conflict.txt"), "baseline").unwrap();
-    fs::write(fixture.path().join("z-last.txt"), "baseline").unwrap();
+    fs::write(fixture.path().join("conflict.txt"), [0]).unwrap();
+    fs::write(fixture.path().join("z-last.txt"), [0]).unwrap();
     git_output(fixture.path(), &["add", "."]);
     git_output(fixture.path(), &["commit", "-m", "baseline"]);
 
     git_output(fixture.path(), &["switch", "-c", "other"]);
-    fs::write(fixture.path().join("conflict.txt"), "other branch").unwrap();
+    fs::write(fixture.path().join("conflict.txt"), [0, 1]).unwrap();
     git_output(fixture.path(), &["add", "conflict.txt"]);
     git_output(fixture.path(), &["commit", "-m", "other conflict change"]);
 
     git_output(fixture.path(), &["switch", "main"]);
-    fs::write(fixture.path().join("conflict.txt"), "main branch").unwrap();
+    fs::write(fixture.path().join("conflict.txt"), [0, 2]).unwrap();
     git_output(fixture.path(), &["add", "conflict.txt"]);
     git_output(fixture.path(), &["commit", "-m", "main conflict change"]);
     let merge = StdCommand::new("git")
@@ -416,8 +863,24 @@ async fn provider_rejects_malformed_and_empty_completions() {
             Some("malformed-provider-body-marker"),
         ),
         (
-            json!({"choices": [{"message": {"role": "assistant", "content": "  "}}]}).to_string(),
+            json!({
+                "choices": [{"message": {"role": "assistant", "content": "  "}}],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "prompt_tokens_details": {
+                        "prompt_cache_hit_tokens": 0,
+                        "prompt_cache_miss_tokens": 10
+                    }
+                }
+            })
+            .to_string(),
             "пустой ответ",
+            None,
+        ),
+        (
+            json!({"choices": [{"message": {"role": "assistant", "content": "missing usage"}}]})
+                .to_string(),
+            "token usage",
             None,
         ),
     ];
@@ -698,6 +1161,7 @@ fn selected_project_or_fixture() -> (Option<TempDir>, PathBuf) {
         "# Schema\nThe transaction-import.v3 schema describes structured import data.",
     )
     .unwrap();
+    git_output(fixture.path(), &["add", "docs/data-api.md"]);
     let root = fixture.path().to_owned();
     (Some(fixture), root)
 }
@@ -714,6 +1178,7 @@ fn git_project_with_docs(readme: &str, architecture: &str) -> TempDir {
     fs::write(fixture.path().join("README.md"), readme).unwrap();
     fs::write(fixture.path().join("docs/architecture.md"), architecture).unwrap();
     initialize_git(fixture.path());
+    git_output(fixture.path(), &["add", "README.md", "docs"]);
     fixture
 }
 
@@ -763,8 +1228,7 @@ async fn run_cli(
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_developer-assistant"));
     command
-        .arg("--project-root")
-        .arg(project_root)
+        .current_dir(project_root)
         .arg("--config")
         .arg(&config_path)
         .arg("/help")
@@ -781,6 +1245,38 @@ async fn run_cli(
         .expect("developer-assistant binary starts")
 }
 
+async fn run_cli_with_git_index(
+    project_root: &Path,
+    question: &str,
+    base_url: &str,
+    api_key: &str,
+    alternate_index: &Path,
+) -> Output {
+    let config_directory = TempDir::new().expect("temporary config directory");
+    let config_path = config_directory.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[providers.test]\nbase_url = \"{base_url}\"\napi_key_env = \"DEVELOPER_ASSISTANT_API_KEY\"\nmodels = [\"gpt-4o-mini\"]\n\n[selection]\ndefault_model = \"test/gpt-4o-mini\"\n"
+        ),
+    )
+    .expect("test config is written");
+
+    Command::new(env!("CARGO_BIN_EXE_developer-assistant"))
+        .current_dir(project_root)
+        .arg("--config")
+        .arg(config_path)
+        .arg("/help")
+        .arg(question)
+        .env("DEVELOPER_ASSISTANT_API_KEY", api_key)
+        .env("GIT_INDEX_FILE", alternate_index)
+        .env_remove("DEVELOPER_ASSISTANT_BASE_URL")
+        .env_remove("DEVELOPER_ASSISTANT_MODEL")
+        .output()
+        .await
+        .expect("developer-assistant binary starts")
+}
+
 async fn run_cli_with_config(
     project_root: &Path,
     config_path: &Path,
@@ -790,8 +1286,7 @@ async fn run_cli_with_config(
 ) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_developer-assistant"));
     command
-        .arg("--project-root")
-        .arg(project_root)
+        .current_dir(project_root)
         .arg("--config")
         .arg(config_path)
         .env_remove("DEVELOPER_ASSISTANT_API_KEY")
@@ -821,8 +1316,7 @@ async fn run_repl(
 ) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_developer-assistant"));
     command
-        .arg("--project-root")
-        .arg(project_root)
+        .current_dir(project_root)
         .arg("--config")
         .arg(config_path)
         .env_remove("DEVELOPER_ASSISTANT_API_KEY")
@@ -910,6 +1404,64 @@ async fn start_provider_batch(
     (format!("http://{address}/v1"), server)
 }
 
+async fn start_provider_script(
+    response_bodies: Vec<String>,
+) -> (String, JoinHandle<Vec<CapturedRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::with_capacity(response_bodies.len());
+        for response_body in response_bodies {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = capture_request(read_complete_request(&mut stream).await);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+            requests.push(request);
+        }
+        requests
+    });
+    (format!("http://{address}/v1"), server)
+}
+
+async fn start_provider_and_update_readme(
+    project_root: PathBuf,
+    response_bodies: Vec<String>,
+) -> (String, JoinHandle<Vec<CapturedRequest>>) {
+    assert_eq!(response_bodies.len(), 2);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::with_capacity(response_bodies.len());
+        for (index, response_body) in response_bodies.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = capture_request(read_complete_request(&mut stream).await);
+            if index == 0 {
+                fs::write(
+                    project_root.join("README.md"),
+                    "# Configuration\nThe configured storage engine uses NEW_ENGINE_MARKER.\n",
+                )
+                .unwrap();
+                git_output(&project_root, &["add", "README.md"]);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body,
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+            requests.push(request);
+        }
+        requests
+    });
+    (format!("http://{address}/v1"), server)
+}
+
 async fn start_redirect_provider() -> (String, JoinHandle<Vec<u8>>, JoinHandle<()>) {
     let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target_address = target_listener.local_addr().unwrap();
@@ -984,12 +1536,47 @@ fn capture_request(request: Vec<u8>) -> CapturedRequest {
     }
 }
 
+fn tool_call_response(id: &str, name: &str, arguments: Value, uncached_tokens: u64) -> String {
+    json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments.to_string()
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": {
+            "prompt_tokens": uncached_tokens,
+            "prompt_tokens_details": {
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": uncached_tokens
+            }
+        }
+    })
+    .to_string()
+}
+
 fn completion_response(content: &str) -> String {
     json!({
         "choices": [{
             "message": {"role": "assistant", "content": content},
             "finish_reason": "stop"
-        }]
+        }],
+        "usage": {
+            "prompt_tokens": 10,
+            "prompt_tokens_details": {
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 10
+            }
+        }
     })
     .to_string()
 }

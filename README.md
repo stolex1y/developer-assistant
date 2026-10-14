@@ -1,8 +1,13 @@
 # Ассистент разработчика
 
-Локальный read-only CLI отвечает на вопросы о структуре проекта по корневому
-`README.md` и Markdown-документам в `docs/`. Текущая Git-ветка и список путей
-поступают через локальный MCP server.
+Локальный read-only CLI отвечает на вопросы о Git-проекте по разрешённым tracked
+text files: README, `docs/`, схемам/API, исходникам, тестам и другим типам файлов,
+допущенным фильтрами. Перед каждым `/help` обновляется in-memory индекс; branch и
+список путей поступают от дочернего MCP server по stdio.
+
+MCP server реализован в `src/mcp.rs`: `get_current_branch` и `list_files`.
+RAG corpus загружает `src/review/corpus.rs`, а index и provider tools
+`search_code`/`read_file` находятся в `src/retrieval.rs` и `src/assistant.rs`.
 
 ## Требования
 
@@ -49,18 +54,20 @@ fake provider в тестах. Redirects не выполняются.
 
 Если config отсутствует, приложение всё равно запускает REPL. `/models` покажет
 пустой список, путь config и `config.example.toml`; файл автоматически не
-создаётся. Пока нет выбранной настроенной модели, `/help` не вызывает provider.
+создаётся. `/help` обновляет локальный индекс и MCP-контекст, но не вызывает
+provider, пока нет выбранной настроенной модели.
 
 ## Запуск и команды
 
-Откройте REPL для текущего Git-проекта:
+Сначала перейдите в корень Git-проекта, который нужно объяснить:
 
 ```bash
-cargo run -- --project-root /path/to/project
+cd /path/to/project
+cargo run --manifest-path /path/to/developer-assistant/Cargo.toml
 ```
 
-Если `--project-root` пропущен, используется текущая директория. Она должна быть
-корнем Git working tree. Команды REPL:
+Текущая директория становится корнем проекта; `--project-root <путь>` остаётся
+необязательным override. REPL:
 
 ```text
 /models
@@ -70,52 +77,83 @@ cargo run -- --project-root /path/to/project
 /exit
 ```
 
+Стрелки вверх/вниз перемещаются по введённым `/help`-вопросам только в текущем
+процессе. История не записывается на диск. Tab дополняет только `/help`,
+`/models`, `/model`, `/exit`; при неоднозначном префиксе показывает варианты.
+Аргументы и обычный текст вопроса не дополняются.
+
 `/model <provider>/<model>` меняет модель только для текущей сессии.
 `/model default <provider>/<model>` сохраняет default в user config и выбирает
 эту модель в текущей сессии. `--model <provider>/<model>` задаёт выбор только
 для запущенного процесса и не меняет сохранённый default.
 
-Одноразовый режим `/help` остаётся доступен:
+Одноразовый режим `/help` остаётся доступен из корня проекта:
 
 ```bash
-cargo run -- --project-root /path/to/project \
+cd /path/to/project
+cargo run --manifest-path /path/to/developer-assistant/Cargo.toml -- \
   --model deepseek/deepseek-flash \
   /help "Как устроена структура проекта?"
 ```
 
-После `cargo build --release` аналогичные команды запускаются через
-`target/release/developer-assistant`. `--config` и `--model` указываются до
-`/help`.
+После `cargo build --release --manifest-path /path/to/developer-assistant/Cargo.toml`
+запускайте `target/release/developer-assistant` из корня проекта. `--config` и
+`--model` указываются до `/help`.
 
 ## Границы и приватность `/help`
 
-- RAG читает только корневой `README.md` и Markdown-файлы из `docs/`.
-  Исходный код, `config/`, `.env`, runtime state, examples и fixtures не сканируются.
-- Поиск локальный, секционный BM25; используется не более пяти passages и 8 KiB
-  текста на запрос. Vector DB и embeddings не используются.
-- MCP-инструменты доступны только для чтения: текущая ветка и не более 50
-  уникальных путей из Git index (`--deduplicate`). Неотслеживаемые пути (включая
-  подпадающие под `.gitignore`), содержимое файлов, diff и команды модели исключены.
+- Перед каждым `/help` Git-список tracked-файлов загружается заново. В REPL
+  остаётся только in-memory индекс; изменённые/новые документы индексируются,
+  удалённые исчезают, неизменённые passages переиспользуются.
+- RAG использует до пяти начальных passages и 8 KiB текста. Если корпус
+  непустой, но начального совпадения нет, provider всё равно получает read-only
+  tools и может запросить контекст. Если допустимых файлов нет, provider не вызывается.
+- Допустимый corpus повторяет фильтры PR reviewer: tracked regular files
+  (Git modes `100644`/`100755`), без файлов под `.gitignore`, symlinks,
+  generated/build/vendor-каталогов, minified/map/lock-файлов, secret-like paths,
+  binary/NUL, non-UTF-8 и empty files. Лимиты: 10 000 файлов, 256 KiB на файл,
+  16 MiB суммарно. Диагностика показывает причины пропусков и только safe path
+  examples. Фильтры и redaction — эвристики, не DLP.
+- Локальный BM25 работает по исходникам, тестам, README, docs, схемам и другим
+  допустимым tracked text files; Markdown headings влияют на ранжирование, но
+  остаются метаданными, а не частью body excerpt. Vector DB и embeddings для `/help`
+  не используются.
+- MCP-инструменты показывают текущую ветку и до 50 уникальных tracked paths.
+  Model tools — только `search_code` и `read_file`; они обращаются к тому же
+  отфильтрованному in-memory corpus. `search_code` возвращает до восьми passages
+  и 8 KiB; `read_file` ограничен 80 строками и 8 KiB. Shell, write и diff tools
+  отсутствуют.
+- Markdown sources выводятся как `path#heading` с фактически переданным диапазоном
+  строк; остальные source files — как `path` с фактически переданным диапазоном.
+  Source reference добавляется только после успешной сериализации tool result.
 - MCP subprocess не наследует переменные окружения с ключами настроенных providers.
-- Provider получает пользовательский вопрос, найденные excerpts и branch/path
-  context. Полный README, полный file tree и исходники не отправляются.
+- Provider получает вопрос, ограниченный MCP-контекст, начальные passages и
+  только запрошенные bounded tool results. Полный README, индекс и исходники
+  целиком не отправляются.
 - До retrieval удаляются значения с поддерживаемыми credential-метками после `:` или
   `=`: API key/token, access/refresh token, secret, password, OTP, phone,
   authorization, bearer и несколько русских эквивалентов. Цитируемые значения
   могут содержать пробелы; нецитируемое значение заканчивается на `;` или конце
-  строки. Это эвристика, а не DLP: не помещайте реальные секреты и финансовые
-  данные в README или `docs/`.
+  строки. Не помещайте реальные секреты и финансовые данные в проект.
 - API key не печатается и не сохраняется. Provider errors не включают raw body.
-  Учитывайте, что запрос и отобранные excerpts покидают компьютер при remote
-  provider call.
-- Model получает только system/user messages, без tools; результат не выполняется
-  и не меняет проект.
+  Запросы и найденные excerpts покидают компьютер при remote provider call.
+- Tool loop суммирует uncached input tokens ответов с включёнными tools до
+  30 000 на один `/help`; фиксированного call-count limit нет. После достижения
+  лимита новые tools не исполняются; один финальный запрос отправляется без
+  tools. Его usage проверяется, показывается отдельно и не прибавляется к loop
+  budget. Отсутствующие или противоречивые counters останавливают запрос без
+  оценки токенов и fallback.
+- При этом token-only limit не ограничивает provider, который многократно возвращает новые tool calls с нулевыми uncached input tokens. Отдельного ограничения числа вызовов нет по согласованному контракту.
 - Перед выводом экранируются terminal controls и bidi-direction marks в ответе,
-  Git branch, путях и source headings; обычные переводы строки в ответе сохраняются.
+  Git branch, путях и source citations; переводы строк в ответе сохраняются.
 
-Provider contract: OpenAI-compatible `POST /chat/completions`, `temperature=0`,
-`max_tokens=800`, timeout 60 секунд. DeepSeek profile в `config.example.toml`
-использует официальный base URL и model IDs `deepseek-flash` и `deepseek-v4-pro`.
+Provider contract: OpenAI-compatible `POST /chat/completions`, function calling,
+`temperature=0`, `max_tokens=800`, timeout 60 секунд. Каждый ответ должен
+содержать `prompt_tokens` и `prompt_tokens_details` с согласованными cache-hit /
+cache-miss counters (`cached_tokens` — допустимый alias). DeepSeek profile в
+`config.example.toml` использует официальный base URL и model IDs
+`deepseek-flash` и `deepseek-v4-pro`.
+
 
 ## Автоматическое ревью pull request
 

@@ -1,6 +1,7 @@
 pub mod assistant;
 pub mod cli;
 pub mod config;
+pub(crate) mod git_process;
 pub mod mcp;
 pub mod provider;
 pub mod repl;

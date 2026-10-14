@@ -1,3 +1,4 @@
+use crate::git_process::{isolate_std_git_environment, isolate_tokio_git_environment};
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::{
     ServiceExt,
@@ -17,17 +18,6 @@ use tokio::{
 };
 
 const MAX_LISTED_FILES: usize = 50;
-const GIT_ENV_TO_CLEAR: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_COMMON_DIR",
-    "GIT_PREFIX",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-];
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FileInventory {
@@ -246,18 +236,4 @@ async fn run_git_async(root: &Path, args: &[&str]) -> std::io::Result<std::proce
     command.arg("-C").arg(root).args(args);
     isolate_tokio_git_environment(&mut command);
     command.output().await
-}
-
-fn isolate_std_git_environment(command: &mut StdCommand) {
-    for variable in GIT_ENV_TO_CLEAR {
-        command.env_remove(variable);
-    }
-    command.env("GIT_OPTIONAL_LOCKS", "0");
-}
-
-fn isolate_tokio_git_environment(command: &mut Command) {
-    for variable in GIT_ENV_TO_CLEAR {
-        command.env_remove(variable);
-    }
-    command.env("GIT_OPTIONAL_LOCKS", "0");
 }

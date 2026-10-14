@@ -1,3 +1,4 @@
+use crate::git_process::isolate_std_git_environment;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -38,7 +39,48 @@ pub struct SourceDocument {
     pub text: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CorpusDiagnostics {
+    pub tracked_regular_files: usize,
+    pub path_filtered_files: usize,
+    pub git_ignored_files: usize,
+    pub non_regular_files: usize,
+    pub missing_files: usize,
+    pub outside_root_files: usize,
+    pub oversized_files: usize,
+    pub binary_files: usize,
+    pub non_utf8_files: usize,
+    pub empty_files: usize,
+    pub secret_content_files: usize,
+    pub safe_skipped_paths: Vec<String>,
+}
+
+impl CorpusDiagnostics {
+    pub fn skipped_files(&self) -> usize {
+        self.path_filtered_files
+            + self.git_ignored_files
+            + self.non_regular_files
+            + self.missing_files
+            + self.outside_root_files
+            + self.oversized_files
+            + self.binary_files
+            + self.non_utf8_files
+            + self.empty_files
+            + self.secret_content_files
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LoadedCorpus {
+    pub documents: Vec<SourceDocument>,
+    pub diagnostics: CorpusDiagnostics,
+}
+
 pub fn load_project_corpus(project_root: &Path) -> Result<Vec<SourceDocument>> {
+    Ok(load_project_corpus_with_diagnostics(project_root)?.documents)
+}
+
+pub fn load_project_corpus_with_diagnostics(project_root: &Path) -> Result<LoadedCorpus> {
     let root = project_root.canonicalize().with_context(|| {
         format!(
             "Не удалось открыть корень проекта {}.",
@@ -49,14 +91,24 @@ pub fn load_project_corpus(project_root: &Path) -> Result<Vec<SourceDocument>> {
         bail!("Корень проекта не является директорией.");
     }
 
-    let candidates = list_tracked_regular_paths(&root)?
-        .into_iter()
-        .filter(|path| !is_excluded_path(path))
-        .collect::<Vec<_>>();
+    let regular_paths = list_tracked_regular_paths(&root)?;
+    let mut diagnostics = CorpusDiagnostics {
+        tracked_regular_files: regular_paths.len(),
+        ..CorpusDiagnostics::default()
+    };
+    let mut candidates = Vec::with_capacity(regular_paths.len());
+    for path in regular_paths {
+        if is_excluded_path(&path) {
+            diagnostics.path_filtered_files += 1;
+        } else {
+            candidates.push(path);
+        }
+    }
     if candidates.len() > MAX_CORPUS_FILES {
         bail!("В проекте слишком много допустимых tracked-файлов для безопасной индексации.");
     }
     let ignored = ignored_paths(&root, &candidates)?;
+    diagnostics.git_ignored_files = ignored.len();
 
     let mut documents = Vec::new();
     let mut total_bytes = 0usize;
@@ -68,37 +120,75 @@ pub fn load_project_corpus(project_root: &Path) -> Result<Vec<SourceDocument>> {
         let absolute_path = root.join(&path);
         let metadata = match fs::symlink_metadata(&absolute_path) {
             Ok(metadata) if metadata.file_type().is_file() => metadata,
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(_) => {
+                diagnostics.non_regular_files += 1;
+                record_safe_skipped_path(&mut diagnostics, &path);
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                diagnostics.missing_files += 1;
+                record_safe_skipped_path(&mut diagnostics, &path);
+                continue;
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("Не удалось проверить файл {path}."));
             }
         };
         if metadata.len() > MAX_FILE_BYTES as u64 {
+            diagnostics.oversized_files += 1;
+            record_safe_skipped_path(&mut diagnostics, &path);
             continue;
         }
 
         let canonical_path = match absolute_path.canonicalize() {
             Ok(path) if path.starts_with(&root) => path,
-            Ok(_) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(_) => {
+                diagnostics.outside_root_files += 1;
+                record_safe_skipped_path(&mut diagnostics, &path);
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                diagnostics.missing_files += 1;
+                record_safe_skipped_path(&mut diagnostics, &path);
+                continue;
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("Не удалось проверить файл {path}."));
             }
         };
         if !fs::symlink_metadata(&canonical_path)?.file_type().is_file() {
+            diagnostics.non_regular_files += 1;
+            record_safe_skipped_path(&mut diagnostics, &path);
             continue;
         }
 
         let bytes = fs::read(&canonical_path)
             .with_context(|| format!("Не удалось прочитать tracked-файл {path}."))?;
-        if bytes.len() > MAX_FILE_BYTES || bytes.contains(&0) {
+        if bytes.len() > MAX_FILE_BYTES {
+            diagnostics.oversized_files += 1;
+            record_safe_skipped_path(&mut diagnostics, &path);
             continue;
         }
-        let Ok(text) = String::from_utf8(bytes) else {
+        if bytes.contains(&0) {
+            diagnostics.binary_files += 1;
+            record_safe_skipped_path(&mut diagnostics, &path);
             continue;
+        }
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                diagnostics.non_utf8_files += 1;
+                record_safe_skipped_path(&mut diagnostics, &path);
+                continue;
+            }
         };
-        if text.is_empty() || contains_secret_like_value(&text) {
+        if text.is_empty() {
+            diagnostics.empty_files += 1;
+            record_safe_skipped_path(&mut diagnostics, &path);
+            continue;
+        }
+        if contains_secret_like_value(&text) {
+            diagnostics.secret_content_files += 1;
             continue;
         }
 
@@ -110,14 +200,26 @@ pub fn load_project_corpus(project_root: &Path) -> Result<Vec<SourceDocument>> {
     }
 
     documents.sort_by(|left, right| left.path.cmp(&right.path));
-    Ok(documents)
+    Ok(LoadedCorpus {
+        documents,
+        diagnostics,
+    })
+}
+
+fn record_safe_skipped_path(diagnostics: &mut CorpusDiagnostics, path: &str) {
+    if diagnostics.safe_skipped_paths.len() < 10 && !is_excluded_path(path) {
+        diagnostics.safe_skipped_paths.push(path.to_owned());
+    }
 }
 
 fn list_tracked_regular_paths(root: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "--stage", "-z"])
+        .args(["ls-files", "--stage", "-z"]);
+    isolate_std_git_environment(&mut command);
+    let output = command
         .output()
         .context("Не удалось запустить git ls-files для построения project corpus.")?;
     if !output.status.success() {
@@ -163,13 +265,16 @@ fn ignored_paths(root: &Path, paths: &[String]) -> Result<std::collections::Hash
         return Ok(Default::default());
     }
 
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(root)
         .args(["check-ignore", "--no-index", "--stdin", "-z"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    isolate_std_git_environment(&mut command);
+    let mut child = command
         .spawn()
         .context("Не удалось запустить git check-ignore для project corpus.")?;
     let stdin = child

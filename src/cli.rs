@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "developer-assistant",
     version,
-    about = "Ассистент проекта с доступом только для чтения: ответы по README и docs",
+    about = "Read-only ассистент с обновляемым RAG по tracked-файлам проекта и актуальным Git-контекстом",
     disable_help_subcommand = true
 )]
 pub struct Cli {

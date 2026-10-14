@@ -247,6 +247,15 @@ impl ProviderConfig {
     pub fn model(&self) -> &str {
         &self.model
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(endpoint: &str) -> Self {
+        Self {
+            endpoint: Url::parse(endpoint).expect("test endpoint is valid"),
+            api_key: "test-key".to_owned(),
+            model: "test-model".to_owned(),
+        }
+    }
 }
 
 pub fn default_config_path() -> Result<PathBuf> {
