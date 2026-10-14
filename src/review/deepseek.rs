@@ -379,17 +379,35 @@ fn valid_usage(usage: Option<Usage>) -> Result<InputTokenUsage> {
     let details = usage
         .prompt_tokens_details
         .context("DeepSeek не вернул prompt_tokens_details.")?;
-    let cache_miss_tokens = details
-        .prompt_cache_miss_tokens
-        .context("DeepSeek не вернул prompt_cache_miss_tokens; review прекращён без публикации.")?;
     let cache_hit_tokens = match (details.prompt_cache_hit_tokens, details.cached_tokens) {
         (Some(hit), Some(alias)) if hit != alias => {
             bail!("DeepSeek вернул противоречивые cache-hit token counts.");
         }
-        (Some(hit), _) | (_, Some(hit)) => hit,
-        (None, None) => prompt_tokens
-            .checked_sub(cache_miss_tokens)
-            .context("DeepSeek вернул uncached tokens больше общего prompt_tokens.")?,
+        (Some(hit), _) | (_, Some(hit)) => Some(hit),
+        (None, None) => None,
+    };
+    let (cache_hit_tokens, cache_miss_tokens) = match (
+        cache_hit_tokens,
+        details.prompt_cache_miss_tokens,
+    ) {
+        (Some(hit), Some(miss)) => (hit, miss),
+        (Some(hit), None) => (
+            hit,
+            prompt_tokens
+                .checked_sub(hit)
+                .context("DeepSeek вернул cache-hit tokens больше общего prompt_tokens.")?,
+        ),
+        (None, Some(miss)) => (
+            prompt_tokens
+                .checked_sub(miss)
+                .context("DeepSeek вернул uncached tokens больше общего prompt_tokens.")?,
+            miss,
+        ),
+        (None, None) => {
+            bail!(
+                "DeepSeek не вернул cache-hit/cache-miss breakdown; review прекращён без публикации."
+            );
+        }
     };
     if cache_hit_tokens.checked_add(cache_miss_tokens) != Some(prompt_tokens) {
         bail!("DeepSeek вернул противоречивый prompt token usage.");
@@ -534,6 +552,36 @@ mod tests {
     }
 
     #[test]
+    fn token_usage_derives_uncached_count_when_miss_is_omitted() {
+        let usage = serde_json::from_value(json!({
+            "prompt_tokens": 9,
+            "prompt_tokens_details": {
+                "cached_tokens": 5
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            valid_usage(Some(usage)).unwrap(),
+            InputTokenUsage {
+                prompt_tokens: 9,
+                cached_input_tokens: 5,
+                uncached_input_tokens: 4
+            }
+        );
+    }
+
+    #[test]
+    fn token_usage_rejects_cache_hit_above_prompt_total() {
+        let usage = serde_json::from_value(json!({
+            "prompt_tokens": 9,
+            "prompt_tokens_details": {
+                "cached_tokens": 10
+            }
+        }))
+        .unwrap();
+        assert!(valid_usage(Some(usage)).is_err());
+    }
+    #[test]
     fn token_usage_rejects_conflicting_cache_hit_fields() {
         let usage = serde_json::from_value(json!({
             "prompt_tokens": 9,
@@ -560,12 +608,10 @@ mod tests {
     }
 
     #[test]
-    fn token_usage_requires_uncached_count_even_with_cache_hits() {
+    fn token_usage_requires_cache_breakdown() {
         let usage = serde_json::from_value(json!({
             "prompt_tokens": 9,
-            "prompt_tokens_details": {
-                "cached_tokens": 9
-            }
+            "prompt_tokens_details": {}
         }))
         .unwrap();
         assert!(valid_usage(Some(usage)).is_err());

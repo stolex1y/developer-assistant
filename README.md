@@ -139,10 +139,11 @@ DeepSeek получает только допустимый PR diff, отобр�
 отправляются. По умолчанию caller задаёт лимит 30 000 uncached input tokens для
 tool-enabled запросов; usage финального запроса без tools показывается отдельно.
 Изменить лимит можно в `with.max_uncached_input_tokens` caller workflow.
-Для проверки согласованности нужны `prompt_tokens` и `prompt_cache_miss_tokens`;
-cache-hit count читается из `prompt_cache_hit_tokens` или `cached_tokens`, а если
-его нет — вычисляется как разница. Отсутствующий uncached usage или противоречивые
-значения останавливают review без публикации.
+Для учёта нужны `prompt_tokens` и хотя бы один cache counter. Если provider
+возвращает `prompt_cache_miss_tokens`, используется он; иначе uncached count
+вычисляется как `prompt_tokens - cache-hit count` (`prompt_cache_hit_tokens` или
+`cached_tokens`). Отсутствие обоих counters или противоречивые значения
+останавливают review без публикации.
 
 В целевом GitHub repository задайте Actions secret `DEEPSEEK_API_KEY`.
 `GITHUB_TOKEN` workflow получает автоматически с `contents: read` и
