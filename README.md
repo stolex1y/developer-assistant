@@ -113,21 +113,21 @@ cargo run --manifest-path /path/to/developer-assistant/Cargo.toml -- \
   generated/build/vendor-каталогов, minified/map/lock-файлов, secret-like paths,
   binary/NUL, non-UTF-8 и empty files. Лимит: 10 000 файлов; per-file и aggregate
   source-byte caps отсутствуют. D31 держит corpus/index в памяти, поэтому RAM и
-  время растут с объёмом. D32 отдельно сохраняет 256 MiB предел serialized embedding
-  cache. Диагностика показывает причины пропусков и только safe path examples.
-  Фильтры и redaction — эвристики, не DLP.
+  время растут с объёмом. D32 отдельно сохраняет 256 MiB предел serialized
+  embedding cache. Во время успешного `/help` причины пропусков и path examples
+  не печатаются; ошибки остаются видимыми. Фильтры и redaction — эвристики, не DLP.
 - Локальный BM25 работает по исходникам, тестам, README, docs, схемам и другим
   допустимым tracked text files; Markdown headings влияют на ранжирование, но
   остаются метаданными, а не частью body excerpt. Vector DB и embeddings для `/help`
   не используются.
-- MCP-инструменты показывают текущую ветку и до 50 уникальных tracked paths.
+- Внутренний MCP-контекст содержит текущую ветку и до 50 уникальных tracked paths;
+  этот список не выводится перед успешным ответом.
   Model tools — только `search_code` и `read_file`; они обращаются к тому же
   отфильтрованному in-memory corpus. `search_code` возвращает до восьми passages
   и 8 KiB; `read_file` ограничен 80 строками и 8 KiB. Shell, write и diff tools
   отсутствуют.
-- Markdown sources выводятся как `path#heading` с фактически переданным диапазоном
-  строк; остальные source files — как `path` с фактически переданным диапазоном.
-  Source reference добавляется только после успешной сериализации tool result.
+- Ответ сохраняет inline citations модели, но приложение не добавляет отдельный
+  footer `Источники:` и не собирает список source references для печати.
 - Ответ `/help` рендерится как Markdown: headings, emphasis, ordered/unordered
   lists, inline/fenced code, links и tables. Таблицы шире терминала и все таблицы
   со ссылками выводятся как строки «заголовок: значение» с переносом по ширине,
@@ -138,7 +138,8 @@ cargo run --manifest-path /path/to/developer-assistant/Cargo.toml -- \
 - MCP subprocess не наследует переменные окружения с ключами настроенных providers.
 - Provider получает вопрос, ограниченный MCP-контекст, начальные passages и
   только запрошенные bounded tool results. Полный README, индекс и исходники
-  целиком не отправляются.
+  целиком не отправляются. Успешный вывод не печатает MCP inventory или счётчики
+  индекса; остаются ответ и token-budget line.
 - До retrieval удаляются значения с поддерживаемыми credential-метками после `:` или
   `=`: API key/token, access/refresh token, secret, password, OTP, phone,
   authorization, bearer и несколько русских эквивалентов. Цитируемые значения
@@ -157,11 +158,12 @@ cargo run --manifest-path /path/to/developer-assistant/Cargo.toml -- \
   Git branch, путях и source citations; переводы строк в ответе сохраняются.
 
 Provider contract: OpenAI-compatible `POST /chat/completions`, function calling,
-`temperature=0`, `max_tokens=800`, timeout 60 секунд. Каждый ответ должен
-содержать `prompt_tokens` и `prompt_tokens_details` с согласованными cache-hit /
-cache-miss counters (`cached_tokens` — допустимый alias). DeepSeek profile в
-`config.example.toml` использует официальный base URL и model IDs
-`deepseek-flash` и `deepseek-v4-pro`.
+`temperature=0`, `max_tokens=4096`, timeout 60 секунд. Если финальный completion
+имеет `finish_reason=length`, `/help` явно помечает ответ как неполный и не
+повторяет запрос. Каждый ответ должен содержать `prompt_tokens` и
+`prompt_tokens_details` с согласованными cache-hit / cache-miss counters
+(`cached_tokens` — допустимый alias). DeepSeek profile в `config.example.toml`
+использует официальный base URL и model IDs `deepseek-flash` и `deepseek-v4-pro`.
 
 
 ## Автоматическое ревью pull request

@@ -17,7 +17,10 @@ use tokio::{
 const TEST_API_KEY: &str = "local-test-key-not-a-credential";
 const STRUCTURE_QUESTION: &str =
     "Какие Gradle-модули есть, где web entry point и что описывает schema transaction-import.v3?";
-const STRUCTURE_ANSWER: &str = "Проект делится на core, transport, persistence и web; основной интерфейс — GET /agent; schema transaction-import.v3 описывает импорт операций.";
+const STRUCTURE_ANSWER: &str = concat!(
+    "Проект делится на core, transport, persistence и web; основной интерфейс — GET /agent; ",
+    "schema transaction-import.v3 описывает импорт операций. [docs/data-api.md#API:L1-L4]"
+);
 const MARKDOWN_ANSWER: &str = r#"# D31 preview
 
 **Bold** and *italic*.
@@ -35,7 +38,9 @@ fn render() {}
 
 | Item | State |
 | --- | --- |
-| renderer | ready |"#;
+| renderer | ready |
+
+Evidence: [docs/architecture.md#Architecture:L1-L2]"#;
 struct CapturedRequest {
     request_line: String,
     body: Vec<u8>,
@@ -84,8 +89,8 @@ async fn help_uses_docs_and_live_mcp_context() {
     assert!(normalized.contains("core"));
     assert!(normalized.contains("GET /agent"));
     assert!(normalized.contains("transaction-import.v3"));
-    assert!(stdout.contains("docs/architecture.md"));
-    assert!(stdout.contains("Источники:"));
+    assert_compact_help_output(&stdout);
+    assert!(stdout.contains("[docs/data-api.md#API:L1-L4]"));
 
     assert_eq!(requests.len(), 2);
     let request: Value =
@@ -101,11 +106,10 @@ async fn help_uses_docs_and_live_mcp_context() {
         .expect("search_code result is sent back to the model");
     assert!(search_result.contains("docs/data-api.md"));
     assert!(search_result.contains("transaction-import.v3"));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("docs/data-api.md#"));
 
     assert_eq!(request["model"], "gpt-4o-mini");
     assert_eq!(request["temperature"], 0.0);
-    assert_eq!(request["max_tokens"], 800);
+    assert_eq!(request["max_tokens"], 4096);
     assert_eq!(request["tool_choice"], "auto");
     assert_eq!(request["tools"].as_array().unwrap().len(), 2);
     assert_eq!(request["tools"][0]["function"]["name"], "search_code");
@@ -190,6 +194,72 @@ async fn help_renders_markdown_in_repl() {
     assert_readable_markdown_answer(&String::from_utf8_lossy(&output.stdout));
 }
 
+#[tokio::test]
+async fn help_marks_length_completion_as_incomplete_without_retry() {
+    let fixture = git_project_with_docs(
+        "# Overview\nThe project handles structure questions.",
+        "# Architecture\nThe interface is documented.",
+    );
+    let response = completion_response_with_finish_reason("The answer was cut off.", "length");
+    let (base_url, fake_provider) = start_provider("200 OK", response).await;
+
+    let output = run_cli(
+        fixture.path(),
+        "Что делает проект?",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    if !output.status.success() {
+        fake_provider.abort();
+        panic!("CLI failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let request_body = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("CLI did not finish after the length completion")
+        .expect("fake provider task completed");
+    let request: Value =
+        serde_json::from_slice(&request_body).expect("fake provider got valid JSON");
+
+    assert_eq!(request["max_tokens"], 4096);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Предупреждение: ответ неполный"));
+    assert_compact_help_output(&stdout);
+}
+
+#[tokio::test]
+async fn help_does_not_mark_stopped_completion_incomplete() {
+    let fixture = git_project_with_docs(
+        "# Overview\nThe project handles structure questions.",
+        "# Architecture\nThe interface is documented.",
+    );
+    let (base_url, fake_provider) =
+        start_provider("200 OK", completion_response("Полный ответ.")).await;
+
+    let output = run_cli(
+        fixture.path(),
+        "Что делает проект?",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    if !output.status.success() {
+        fake_provider.abort();
+        panic!("CLI failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let request_body = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("CLI did not finish after the stop completion")
+        .expect("fake provider task completed");
+    let request: Value =
+        serde_json::from_slice(&request_body).expect("fake provider got valid JSON");
+
+    assert_eq!(request["max_tokens"], 4096);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("Предупреждение: ответ неполный"));
+    assert_compact_help_output(&stdout);
+}
+
 fn assert_readable_markdown_answer(stdout: &str) {
     let answer = stdout
         .split_once("Ответ:\n")
@@ -210,6 +280,7 @@ fn assert_readable_markdown_answer(stdout: &str) {
         "https://example.test/docs",
         "renderer",
         "ready",
+        "docs/architecture.md#Architecture:L1-L2",
     ] {
         assert!(
             answer.contains(visible),
@@ -222,19 +293,31 @@ fn assert_readable_markdown_answer(stdout: &str) {
     assert!(!answer.contains("| Item |"));
     assert!(!answer.contains("[Project docs]"));
     assert!(!stdout.contains('\u{1b}'));
-    assert!(
-        stdout
-            .split_once("\n\nToken budget:")
-            .expect("diagnostics follow answer")
-            .1
-            .contains("Источники:")
-    );
+    assert_compact_help_output(stdout);
+}
+
+fn assert_compact_help_output(stdout: &str) {
+    for hidden in [
+        "Ветка Git:",
+        "Файлы через MCP:",
+        "RAG:",
+        "Пропущено tracked-файлов:",
+        "Безопасные примеры пропущенных файлов:",
+        "Источники:",
+    ] {
+        assert!(
+            !stdout.contains(hidden),
+            "successful /help output leaked {hidden}"
+        );
+    }
+    assert!(stdout.contains("Token budget:"));
 }
 
 #[tokio::test]
-async fn help_retrieves_readme_as_a_cited_source() {
+async fn help_preserves_inline_model_citation_without_footer() {
     let (_fixture, root) = selected_project_or_fixture();
-    let response = completion_response("README описывает read-only trace проекта.");
+    let response =
+        completion_response("README описывает read-only trace проекта [README.md:L1-L2].");
     let (base_url, fake_provider) = start_provider("200 OK", response).await;
 
     let output = run_cli(
@@ -258,12 +341,13 @@ async fn help_retrieves_readme_as_a_cited_source() {
     assert!(prompt.contains("[README.md#"));
     assert!(prompt.contains("read-only trace"));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("README.md#"));
-    assert!(stdout.contains("Источники:"));
+    assert!(stdout.contains("[README.md:L1-L2]"));
+    assert!(!stdout.contains("Источники:"));
+    assert_compact_help_output(&stdout);
 }
 
 #[tokio::test]
-async fn help_read_file_returns_heading_and_prints_citable_markdown_source() {
+async fn help_read_file_returns_heading_and_preserves_model_citation() {
     let fixture = git_project_with_docs(
         "# Overview\nThe repository has a small local interface.",
         "# Architecture\nThe service exposes a local interface.",
@@ -275,7 +359,9 @@ async fn help_read_file_returns_heading_and_prints_citable_markdown_source() {
             json!({"path": "docs/architecture.md", "start_line": 2, "end_line": 2}),
             12,
         ),
-        completion_response("Интерфейс описан в архитектурной документации."),
+        completion_response(
+            "Интерфейс описан в архитектурной документации [docs/architecture.md#Architecture:L2-L2].",
+        ),
     ];
     let (base_url, fake_provider) = start_provider_script(responses).await;
 
@@ -313,10 +399,9 @@ async fn help_read_file_returns_heading_and_prints_citable_markdown_source() {
             .unwrap()
             .contains("The service exposes a local interface.")
     );
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("`docs/architecture.md#Architecture` (строки 2–2)")
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[docs/architecture.md#Architecture:L2-L2]"));
+    assert_compact_help_output(&stdout);
 }
 
 #[tokio::test]
@@ -364,57 +449,8 @@ async fn help_preserves_large_quoted_read_file_result() {
     assert_eq!(payload["end_line"], 2);
     assert!(payload["text"].as_str().unwrap().contains(&quoted));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("`docs/architecture.md#Architecture` (строки 2–2)"),
-        "{stdout}"
-    );
-}
-
-#[tokio::test]
-async fn help_cites_only_the_lines_returned_by_read_file() {
-    let fixture = git_project_with_docs(
-        "# Overview\nThe repository has a local interface.",
-        "# Architecture\nThe service exposes a local interface.\n",
-    );
-    let responses = vec![
-        tool_call_response(
-            "read-architecture",
-            "read_file",
-            json!({"path": "docs/architecture.md", "start_line": 1, "end_line": 80}),
-            12,
-        ),
-        completion_response("Архитектура описывает интерфейс."),
-    ];
-    let (base_url, fake_provider) = start_provider_script(responses).await;
-
-    let output = run_cli(
-        fixture.path(),
-        "Как устроен интерфейс?",
-        Some(&base_url),
-        Some(TEST_API_KEY),
-    )
-    .await;
-    let requests = timeout(Duration::from_secs(5), fake_provider)
-        .await
-        .expect("tool loop did not complete")
-        .expect("fake provider task completed");
-
-    assert!(output.status.success());
-    let followup: Value = serde_json::from_slice(&requests[1].body).unwrap();
-    let tool_result = followup["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|message| message["role"] == "tool")
-        .and_then(|message| message["content"].as_str())
-        .expect("read_file result is sent back to the model");
-    let payload: Value = serde_json::from_str(tool_result).unwrap();
-    assert_eq!(payload["start_line"], 1);
-    assert_eq!(payload["end_line"], 2);
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("`docs/architecture.md#Architecture` (строки 1–2)")
-    );
+    assert!(stdout.contains("Цитируемый фрагмент получен."));
+    assert_compact_help_output(&stdout);
 }
 
 #[tokio::test]
@@ -664,7 +700,8 @@ async fn help_without_relevant_docs_skips_provider() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Ветка Git: `main`"));
+    assert!(!stdout.contains("Ветка Git:"));
+    assert!(!stdout.contains("Файлы через MCP:"));
     assert!(stdout.contains("В filtered corpus нет допустимых tracked-файлов"));
     assert!(stdout.contains("provider не вызывался"));
 }
@@ -705,26 +742,48 @@ async fn help_calls_provider_with_tools_when_initial_retrieval_has_no_match() {
 }
 
 #[tokio::test]
-async fn mcp_limits_file_list_and_reports_total_count() {
+async fn mcp_limits_file_list_in_prompt_without_printing_it() {
     let fixture = empty_git_project();
     for index in 0..55 {
-        fs::write(fixture.path().join(format!("source-{index:02}.txt")), "").unwrap();
+        fs::write(
+            fixture.path().join(format!("source-{index:02}.txt")),
+            format!("# Source {index}\nProject detail {index}.\n"),
+        )
+        .unwrap();
     }
     git_output(fixture.path(), &["add", "."]);
+    let (base_url, fake_provider) =
+        start_provider("200 OK", completion_response("Структура проекта описана.")).await;
 
-    let output = run_cli(fixture.path(), "Опиши структуру файлов.", None, None).await;
+    let output = run_cli(
+        fixture.path(),
+        "Опиши структуру файлов.",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    let request_body = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("CLI did not call fake provider")
+        .expect("fake provider task completed");
+    let request: Value =
+        serde_json::from_slice(&request_body).expect("provider request is valid JSON");
+    let prompt = user_prompt(&request);
 
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(prompt.contains("Пути проекта (55 всего)"));
+    assert!(prompt.contains("- source-00.txt"));
+    assert!(prompt.contains("- source-49.txt"));
+    assert!(!prompt.contains("- source-50.txt"));
+    assert!(prompt.contains("список сокращён до 50 путей"));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Файлы через MCP: 50 из 55"));
-    assert!(stdout.contains("- source-00.txt"));
-    assert!(stdout.contains("- source-49.txt"));
-    assert!(!stdout.contains("- source-50.txt"));
-    assert!(stdout.contains("список сокращён до 50 путей"));
+    assert_compact_help_output(&stdout);
+    assert!(!stdout.contains("source-00.txt"));
+    assert!(!stdout.contains("список сокращён до 50 путей"));
 }
 
 #[tokio::test]
@@ -766,17 +825,15 @@ async fn mcp_file_list_excludes_untracked_and_ignored_files() {
     let prompt = user_prompt(&request);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("Файлы через MCP: 4 из 4"));
-    assert!(stdout.contains("- tracked-only.txt"));
-    assert!(!stdout.contains("untracked-only.txt"));
-    assert!(!stdout.contains("ignored-only.txt"));
+    assert!(prompt.contains("Пути проекта (4 всего)"));
     assert!(prompt.contains("tracked-only.txt"));
     assert!(!prompt.contains("untracked-only.txt"));
     assert!(!prompt.contains("ignored-only.txt"));
+    assert_compact_help_output(&stdout);
 }
 
 #[tokio::test]
-async fn mcp_file_inventory_deduplicates_unmerged_stages() {
+async fn mcp_file_inventory_deduplicates_unmerged_stages_in_prompt() {
     let fixture = empty_git_project();
     git_output(fixture.path(), &["config", "user.name", "D31 Test"]);
     git_output(
@@ -786,6 +843,11 @@ async fn mcp_file_inventory_deduplicates_unmerged_stages() {
     for index in 0..48 {
         fs::write(fixture.path().join(format!("a-{index:02}.txt")), [0]).unwrap();
     }
+    fs::write(
+        fixture.path().join("a-00.txt"),
+        "# Project\nThis tracked file makes the corpus nonempty.\n",
+    )
+    .unwrap();
     fs::write(fixture.path().join("conflict.txt"), [0]).unwrap();
     fs::write(fixture.path().join("z-last.txt"), [0]).unwrap();
     git_output(fixture.path(), &["add", "."]);
@@ -811,40 +873,58 @@ async fn mcp_file_inventory_deduplicates_unmerged_stages() {
         "fixture must have an unresolved conflict"
     );
 
-    let output = run_cli(fixture.path(), "Опиши структуру файлов.", None, None).await;
+    let (base_url, fake_provider) =
+        start_provider("200 OK", completion_response("Структура проекта описана.")).await;
+    let output = run_cli(
+        fixture.path(),
+        "Опиши структуру файлов.",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    let request_body = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("CLI did not call fake provider")
+        .expect("fake provider task completed");
+    let request: Value =
+        serde_json::from_slice(&request_body).expect("provider request is valid JSON");
+    let prompt = user_prompt(&request);
 
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(prompt.contains("Пути проекта (50 всего)"));
+    assert_eq!(prompt.matches("- conflict.txt").count(), 1);
+    assert!(prompt.contains("- z-last.txt"));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Файлы через MCP: 50 из 50"));
-    assert_eq!(stdout.matches("- conflict.txt").count(), 1);
-    assert!(stdout.contains("- z-last.txt"));
+    assert_compact_help_output(&stdout);
+    assert!(!stdout.contains("conflict.txt"));
+    assert!(!stdout.contains("z-last.txt"));
 }
 
 #[cfg(unix)]
 #[tokio::test]
-async fn mcp_paths_escape_terminal_controls_before_output() {
+async fn mcp_paths_with_terminal_controls_are_not_printed() {
     let fixture = empty_git_project();
     let path = "control\u{1b}[2J.txt";
     fs::write(fixture.path().join(path), "").unwrap();
     git_output(fixture.path(), &["add", path]);
     let output = run_cli(fixture.path(), "Опиши структуру файлов.", None, None).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("control\\u{1b}[2J.txt"));
+    assert!(!stdout.contains(path));
     assert!(!stdout.contains('\u{1b}'));
 }
 
 #[tokio::test]
-async fn mcp_bidi_controls_are_escaped_before_output() {
+async fn mcp_bidi_controls_are_not_printed() {
     let fixture = empty_git_project();
     let branch = "main\u{202e}hidden";
     git_output(fixture.path(), &["branch", "-m", branch]);
@@ -853,15 +933,17 @@ async fn mcp_bidi_controls_are_escaped_before_output() {
     git_output(fixture.path(), &["add", path]);
 
     let output = run_cli(fixture.path(), "Опиши структуру файлов.", None, None).await;
+    let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Ветка Git: `main\\u{202e}hidden`"));
-    assert!(stdout.contains("- source\\u{202e}.txt"));
+    assert!(!stdout.contains("Ветка Git:"));
+    assert!(!stdout.contains("Файлы через MCP:"));
+    assert!(!stdout.contains(branch));
+    assert!(!stdout.contains(path));
     assert!(!stdout.contains('\u{202e}'));
 }
 
@@ -1693,10 +1775,14 @@ fn tool_call_response(id: &str, name: &str, arguments: Value, uncached_tokens: u
 }
 
 fn completion_response(content: &str) -> String {
+    completion_response_with_finish_reason(content, "stop")
+}
+
+fn completion_response_with_finish_reason(content: &str, finish_reason: &str) -> String {
     json!({
         "choices": [{
             "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop"
+            "finish_reason": finish_reason
         }],
         "usage": {
             "prompt_tokens": 10,

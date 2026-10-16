@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use std::{collections::HashSet, sync::LazyLock, time::Duration};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_COMPLETION_TOKENS: u32 = 800;
+const MAX_COMPLETION_TOKENS: u32 = 4096;
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
@@ -132,6 +132,7 @@ pub trait ToolExecutor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolLoopResult {
     pub content: String,
+    pub finish_reason: Option<String>,
     pub uncached_input_tokens: u64,
     pub tool_calls_executed: u64,
     pub requests: u64,
@@ -192,6 +193,8 @@ struct ChatCompletionResponse {
 #[derive(Deserialize)]
 struct Choice {
     message: AssistantResponse,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -246,6 +249,7 @@ pub async fn tool_loop(
                 .context("Provider вернул пустой ответ.")?;
             return Ok(ToolLoopResult {
                 content,
+                finish_reason: choice.finish_reason,
                 uncached_input_tokens,
                 tool_calls_executed,
                 requests,
@@ -282,6 +286,7 @@ pub async fn tool_loop(
                 .context("Provider не вернул финальный ответ после исчерпания token budget.")?;
             return Ok(ToolLoopResult {
                 content,
+                finish_reason: choice.finish_reason,
                 uncached_input_tokens,
                 tool_calls_executed,
                 requests,

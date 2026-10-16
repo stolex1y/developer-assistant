@@ -2,13 +2,18 @@ use crate::{
     config::UserConfig,
     mcp::{self, FileInventory, ProjectContext},
     provider::{self, MAX_TOOL_RESULT_BYTES, ToolExecutor, ToolLoopResult},
-    retrieval::{IndexRefreshSummary, MAX_INITIAL_PASSAGES, ProjectIndex, RetrievedPassage},
+    retrieval::{MAX_INITIAL_PASSAGES, ProjectIndex, RetrievedPassage},
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    borrow::Cow, collections::HashSet, fmt::Write as _, io::IsTerminal, ops::Range, path::Path,
+    borrow::Cow,
+    collections::HashSet,
+    fmt::Write as _,
+    io::{self, IsTerminal},
+    ops::Range,
+    path::Path,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -21,22 +26,11 @@ const MAX_SEARCH_RESULTS: usize = 8;
 pub enum HelpResult {
     NoCorpus {
         project: ProjectContext,
-        index: IndexRefreshSummary,
     },
     Answer {
         project: ProjectContext,
-        index: IndexRefreshSummary,
-        sources: Vec<SourceReference>,
         usage: ToolLoopResult,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct SourceReference {
-    pub path: String,
-    pub heading: Option<String>,
-    pub start_line: usize,
-    pub end_line: usize,
 }
 
 pub async fn answer_question(
@@ -50,13 +44,10 @@ pub async fn answer_question(
         bail!("Передайте вопрос после команды /help.");
     }
     let root = mcp::canonical_git_root(project_root)?;
-    let index_summary = index.refresh(&root)?;
+    index.refresh(&root)?;
     let project = mcp::read_project_context(&root, config.provider_key_env_names()).await?;
     if index.is_empty() {
-        return Ok(HelpResult::NoCorpus {
-            project,
-            index: index_summary,
-        });
+        return Ok(HelpResult::NoCorpus { project });
     }
 
     let selected_model = selected_model
@@ -74,71 +65,65 @@ pub async fn answer_question(
         MAX_UNCACHED_INPUT_TOKENS,
     )
     .await?;
-    let sources = collect_sources(&initial_passages, &tools.sources);
-    Ok(HelpResult::Answer {
-        project,
-        index: index_summary,
-        sources,
-        usage,
-    })
+    Ok(HelpResult::Answer { project, usage })
 }
 
 pub fn print_result(result: HelpResult) {
+    let stdout = io::stdout();
+    write_result(&mut stdout.lock(), result).expect("failed to print /help result");
+}
+
+fn write_result(output: &mut impl io::Write, result: HelpResult) -> io::Result<()> {
     let project = match &result {
-        HelpResult::NoCorpus { project, .. } | HelpResult::Answer { project, .. } => project,
+        HelpResult::NoCorpus { project } | HelpResult::Answer { project, .. } => project,
     };
-    print_project_context(project);
+    if let Some(warning) = project_warning_message(project) {
+        writeln!(output, "{warning}")?;
+    }
 
     match result {
-        HelpResult::NoCorpus { index, .. } => {
-            print_index_summary(&index);
-            println!("\nВ filtered corpus нет допустимых tracked-файлов; provider не вызывался.");
+        HelpResult::NoCorpus { .. } => {
+            writeln!(
+                output,
+                "\nВ filtered corpus нет допустимых tracked-файлов; provider не вызывался."
+            )
         }
-        HelpResult::Answer {
-            index,
-            sources,
-            usage,
-            ..
-        } => {
-            print_index_summary(&index);
-            println!("\nОтвет:\n{}", render_markdown_response(&usage.content));
-            println!(
+        HelpResult::Answer { usage, .. } => {
+            writeln!(
+                output,
+                "\nОтвет:\n{}",
+                render_markdown_response(&usage.content)
+            )?;
+            if usage.finish_reason.as_deref() == Some("length") {
+                writeln!(
+                    output,
+                    "\nПредупреждение: ответ неполный — provider остановил генерацию по лимиту длины."
+                )?;
+            }
+            writeln!(
+                output,
                 "\nToken budget: {} uncached input tokens / {} (provider requests: {}, tools executed: {}).",
                 usage.uncached_input_tokens,
                 MAX_UNCACHED_INPUT_TOKENS,
                 usage.requests,
                 usage.tool_calls_executed
-            );
+            )?;
             if let Some(final_usage) = usage.final_usage {
-                println!(
+                writeln!(
+                    output,
                     "Финальный запрос после исчерпания лимита: {} uncached input tokens; он не входит в tool-loop budget.",
                     final_usage.uncached_input_tokens
-                );
+                )?;
             }
-            println!("\nИсточники:");
-            if sources.is_empty() {
-                println!("- Provider не использовал цитируемые passages.");
-            }
-            for source in sources {
-                if let Some(heading) = &source.heading {
-                    println!(
-                        "- `{}#{}` (строки {}–{})",
-                        escape_terminal_field(&source.path),
-                        escape_terminal_field(heading),
-                        source.start_line,
-                        source.end_line
-                    );
-                } else {
-                    println!(
-                        "- `{}` (строки {}–{})",
-                        escape_terminal_field(&source.path),
-                        source.start_line,
-                        source.end_line
-                    );
-                }
-            }
+            Ok(())
         }
     }
+}
+
+fn project_warning_message(project: &ProjectContext) -> Option<String> {
+    project
+        .file_list_warning
+        .map(|warning| format!("Предупреждение: {}", escape_terminal_text(warning)))
 }
 
 pub fn escape_terminal_text(text: &str) -> Cow<'_, str> {
@@ -1457,50 +1442,6 @@ fn append_file_context(prompt: &mut String, files: Option<&FileInventory>) {
     }
 }
 
-fn print_project_context(project: &ProjectContext) {
-    println!("Ветка Git: `{}`", escape_terminal_field(&project.branch));
-    if let Some(files) = &project.files {
-        let listed = files.paths.len();
-        println!("Файлы через MCP: {listed} из {}", files.total);
-        for path in &files.paths {
-            println!("- {}", escape_terminal_field(path));
-        }
-        if files.truncated {
-            println!("- список сокращён до 50 путей");
-        }
-    }
-    if let Some(warning) = &project.file_list_warning {
-        println!("Предупреждение: {}", escape_terminal_text(warning));
-    }
-}
-
-fn print_index_summary(index: &IndexRefreshSummary) {
-    let diagnostics = &index.diagnostics;
-    println!(
-        "RAG: {} файлов; переиндексировано {}, переиспользовано {}, удалено {}.",
-        index.indexed_files, index.reindexed_files, index.reused_files, index.removed_files
-    );
-    println!(
-        "Пропущено tracked-файлов: {} (path-фильтр {}; Git ignore {}; non-regular {}; отсутствуют {}; вне root {}; binary {}; не UTF-8 {}; пустых {}; secret-like content {}).",
-        diagnostics.skipped_files(),
-        diagnostics.path_filtered_files,
-        diagnostics.git_ignored_files,
-        diagnostics.non_regular_files,
-        diagnostics.missing_files,
-        diagnostics.outside_root_files,
-        diagnostics.binary_files,
-        diagnostics.non_utf8_files,
-        diagnostics.empty_files,
-        diagnostics.secret_content_files
-    );
-    if !diagnostics.safe_skipped_paths.is_empty() {
-        println!("Безопасные примеры пропущенных файлов:");
-        for path in &diagnostics.safe_skipped_paths {
-            println!("- {}", escape_terminal_field(path));
-        }
-    }
-}
-
 fn is_markdown_document(path: &str) -> bool {
     Path::new(path)
         .extension()
@@ -1514,47 +1455,13 @@ fn markdown_heading(path: &str, heading: &str) -> Option<String> {
     is_markdown_document(path).then(|| heading.to_owned())
 }
 
-fn collect_sources(
-    passages: &[RetrievedPassage<'_>],
-    tool_sources: &[SourceReference],
-) -> Vec<SourceReference> {
-    let initial_sources = passages.iter().map(|passage| SourceReference {
-        path: passage.passage.source_path.clone(),
-        heading: markdown_heading(&passage.passage.source_path, &passage.passage.heading),
-        start_line: passage.passage.start_line,
-        end_line: passage.excerpt_end_line(),
-    });
-    unique_sources(initial_sources, tool_sources)
-}
-
-fn unique_sources(
-    initial_sources: impl IntoIterator<Item = SourceReference>,
-    tool_sources: &[SourceReference],
-) -> Vec<SourceReference> {
-    let mut seen = HashSet::new();
-    let mut sources = Vec::new();
-    for source in initial_sources
-        .into_iter()
-        .chain(tool_sources.iter().cloned())
-    {
-        if seen.insert(source.clone()) {
-            sources.push(source);
-        }
-    }
-    sources
-}
-
 struct ProjectTools<'a> {
     index: &'a ProjectIndex,
-    sources: Vec<SourceReference>,
 }
 
 impl<'a> ProjectTools<'a> {
     fn new(index: &'a ProjectIndex) -> Self {
-        Self {
-            index,
-            sources: Vec::new(),
-        }
+        Self { index }
     }
 }
 
@@ -1571,31 +1478,20 @@ impl ToolExecutor for ProjectTools<'_> {
                     bail!("search_code получил query или limit вне допустимого диапазона.");
                 }
                 let passages = self.index.search(&arguments.query, arguments.limit);
-                let mut sources = Vec::with_capacity(passages.len());
                 let results = passages
                     .iter()
                     .map(|passage| {
                         let path = &passage.passage.source_path;
-                        let end_line = passage.excerpt_end_line();
-                        let heading = markdown_heading(path, &passage.passage.heading);
-                        sources.push(SourceReference {
-                            path: path.to_owned(),
-                            heading: heading.clone(),
-                            start_line: passage.passage.start_line,
-                            end_line,
-                        });
                         json!({
                             "path": path,
                             "start_line": passage.passage.start_line,
-                            "end_line": end_line,
-                            "heading": heading,
+                            "end_line": passage.excerpt_end_line(),
+                            "heading": markdown_heading(path, &passage.passage.heading),
                             "text": passage.excerpt
                         })
                     })
                     .collect::<Vec<_>>();
-                let result = serialize_bounded_tool_payload(json!({"passages": results}))?;
-                self.sources.extend(sources);
-                Ok(result)
+                serialize_bounded_tool_payload(json!({"passages": results}))
             }
             "read_file" => {
                 let arguments: ReadFileArguments = serde_json::from_value(arguments)
@@ -1615,21 +1511,13 @@ impl ToolExecutor for ProjectTools<'_> {
                     .index
                     .heading_for_range(&arguments.path, excerpt.start_line, excerpt.end_line)
                     .map(str::to_owned);
-                let source = SourceReference {
-                    path: arguments.path.clone(),
-                    heading: heading.clone(),
-                    start_line: excerpt.start_line,
-                    end_line: excerpt.end_line,
-                };
-                let result = serialize_bounded_tool_payload(json!({
+                serialize_bounded_tool_payload(json!({
                     "path": arguments.path,
                     "heading": heading,
                     "start_line": excerpt.start_line,
                     "end_line": excerpt.end_line,
                     "text": excerpt.text
-                }))?;
-                self.sources.push(source);
-                Ok(result)
+                }))
             }
             _ => bail!("Неизвестный read-only tool."),
         }
@@ -1663,15 +1551,14 @@ struct ReadFileArguments {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProjectTools, SearchArguments, SourceReference, build_user_prompt, collect_sources,
-        escape_terminal_field, escape_terminal_text, inspect_markdown,
-        normalize_wide_markdown_tables, render_markdown_at_width, strip_terminal_sequences,
-        unique_sources, visible_terminal_width,
+        HelpResult, ProjectTools, SearchArguments, build_user_prompt, escape_terminal_field,
+        escape_terminal_text, inspect_markdown, normalize_wide_markdown_tables,
+        render_markdown_at_width, strip_terminal_sequences, visible_terminal_width, write_result,
     };
     use crate::{
         git_process::isolate_std_git_environment,
         mcp::{FileInventory, ProjectContext},
-        provider::ToolExecutor,
+        provider::{ToolExecutor, ToolLoopResult},
         retrieval::{ProjectIndex, RetrievedPassage},
     };
     use serde_json::json;
@@ -2016,6 +1903,36 @@ fn render() {}
     }
 
     #[test]
+    fn project_file_list_warning_remains_visible() {
+        let project = ProjectContext {
+            branch: "main".into(),
+            files: None,
+            file_list_warning: Some(
+                "MCP не вернул список файлов; ответ продолжен только с Git-ветки.",
+            ),
+        };
+        let usage = ToolLoopResult {
+            content: "Ответ по документации. [README.md:L1-L2]".into(),
+            finish_reason: Some("stop".into()),
+            uncached_input_tokens: 42,
+            tool_calls_executed: 1,
+            requests: 2,
+            final_usage: None,
+        };
+        let mut output = Vec::new();
+        write_result(&mut output, HelpResult::Answer { project, usage }).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains(
+            "Предупреждение: MCP не вернул список файлов; ответ продолжен только с Git-ветки."
+        ));
+        assert!(output.contains("Ответ:\nОтвет по документации. [README.md:L1-L2]"));
+        assert!(output.contains(
+            "Token budget: 42 uncached input tokens / 30000 (provider requests: 2, tools executed: 1)."
+        ));
+    }
+
+    #[test]
     fn tool_args_reject_unknown_fields_and_zero_limits() {
         assert!(
             serde_json::from_value::<SearchArguments>(json!({
@@ -2043,39 +1960,7 @@ fn render() {}
     }
 
     #[test]
-    fn source_citations_are_unique_and_keep_retrieval_order() {
-        let sources = unique_sources(
-            [
-                SourceReference {
-                    path: "README.md".into(),
-                    heading: Some("Overview".into()),
-                    start_line: 1,
-                    end_line: 2,
-                },
-                SourceReference {
-                    path: "README.md".into(),
-                    heading: Some("Overview".into()),
-                    start_line: 1,
-                    end_line: 2,
-                },
-                SourceReference {
-                    path: "docs/architecture.md".into(),
-                    heading: Some("Modules".into()),
-                    start_line: 4,
-                    end_line: 6,
-                },
-            ],
-            &[],
-        );
-        assert_eq!(sources.len(), 2);
-        assert_eq!(sources[0].path, "README.md");
-        assert_eq!(sources[1].path, "docs/architecture.md");
-        assert_eq!(sources[1].start_line, 4);
-        assert_eq!(sources[1].heading.as_deref(), Some("Modules"));
-    }
-
-    #[test]
-    fn search_payload_and_sources_use_actual_truncated_line_ranges() {
+    fn search_payload_uses_actual_truncated_line_ranges() {
         let root = tempdir().unwrap();
         let lines = (0..2_000)
             .map(|line| format!("budgetmarker line {line:04} details\n"))
@@ -2109,13 +1994,6 @@ fn render() {}
         assert!(prompt.contains(&expected_range));
         assert!(!prompt.contains(&original_range));
 
-        let initial_sources = collect_sources(&passages, &[]);
-        assert!(initial_sources.iter().any(|source| {
-            source.path == "README.md"
-                && source.start_line == truncated.passage.start_line
-                && source.end_line == truncated.excerpt_end_line()
-        }));
-
         let mut tools = ProjectTools::new(&index);
         let result = tools
             .execute("search_code", json!({"query": "budgetmarker", "limit": 8}))
@@ -2123,15 +2001,13 @@ fn render() {}
         let payload: serde_json::Value = serde_json::from_str(&result).unwrap();
         let returned = payload["passages"].as_array().unwrap();
         assert_eq!(returned.len(), passages.len());
-        for ((entry, hit), source) in returned.iter().zip(&passages).zip(&tools.sources) {
+        for (entry, hit) in returned.iter().zip(&passages) {
             let start_line = entry["start_line"].as_u64().unwrap() as usize;
             let end_line = entry["end_line"].as_u64().unwrap() as usize;
             let text = entry["text"].as_str().unwrap();
             assert_eq!(start_line, hit.passage.start_line);
             assert_eq!(end_line, hit.excerpt_end_line());
             assert_eq!(end_line, start_line + text.lines().count() - 1);
-            assert_eq!(source.start_line, start_line);
-            assert_eq!(source.end_line, end_line);
         }
         assert!(returned.iter().zip(&passages).any(|(entry, hit)| {
             (entry["end_line"].as_u64().unwrap() as usize) < hit.passage.end_line
@@ -2139,7 +2015,7 @@ fn render() {}
     }
 
     #[test]
-    fn oversized_search_result_does_not_register_untransmitted_sources() {
+    fn oversized_search_result_returns_error() {
         let root = tempdir().unwrap();
         fs::create_dir_all(root.path().join("docs")).unwrap();
         let heading = "Long heading ".repeat(6_000);
@@ -2160,7 +2036,6 @@ fn render() {}
                 .execute("search_code", json!({"query": "marker", "limit": 1}))
                 .is_err()
         );
-        assert!(tools.sources.is_empty());
     }
 
     fn git(root: &Path, arguments: &[&str]) {
