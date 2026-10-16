@@ -1,17 +1,16 @@
 use crate::git_process::isolate_std_git_environment;
 use anyhow::{Context, Result, bail};
 use regex::Regex;
+use same_file::Handle;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path},
     process::{Command, Stdio},
     sync::LazyLock,
 };
 
-const MAX_FILE_BYTES: usize = 256 * 1024;
-const MAX_CORPUS_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CORPUS_FILES: usize = 10_000;
 
 static SECRET_PATTERNS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
@@ -47,7 +46,6 @@ pub struct CorpusDiagnostics {
     pub non_regular_files: usize,
     pub missing_files: usize,
     pub outside_root_files: usize,
-    pub oversized_files: usize,
     pub binary_files: usize,
     pub non_utf8_files: usize,
     pub empty_files: usize,
@@ -62,7 +60,6 @@ impl CorpusDiagnostics {
             + self.non_regular_files
             + self.missing_files
             + self.outside_root_files
-            + self.oversized_files
             + self.binary_files
             + self.non_utf8_files
             + self.empty_files
@@ -111,15 +108,14 @@ pub fn load_project_corpus_with_diagnostics(project_root: &Path) -> Result<Loade
     diagnostics.git_ignored_files = ignored.len();
 
     let mut documents = Vec::new();
-    let mut total_bytes = 0usize;
     for path in candidates {
         if ignored.contains(&path) {
             continue;
         }
 
         let absolute_path = root.join(&path);
-        let metadata = match fs::symlink_metadata(&absolute_path) {
-            Ok(metadata) if metadata.file_type().is_file() => metadata,
+        match fs::symlink_metadata(&absolute_path) {
+            Ok(metadata) if metadata.file_type().is_file() => (),
             Ok(_) => {
                 diagnostics.non_regular_files += 1;
                 record_safe_skipped_path(&mut diagnostics, &path);
@@ -134,8 +130,27 @@ pub fn load_project_corpus_with_diagnostics(project_root: &Path) -> Result<Loade
                 return Err(error).with_context(|| format!("Не удалось проверить файл {path}."));
             }
         };
-        if metadata.len() > MAX_FILE_BYTES as u64 {
-            diagnostics.oversized_files += 1;
+
+        let mut open_options = fs::OpenOptions::new();
+        open_options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_options.custom_flags(libc::O_NONBLOCK);
+        }
+        let mut file = match open_options.open(&absolute_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                diagnostics.missing_files += 1;
+                record_safe_skipped_path(&mut diagnostics, &path);
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Не удалось открыть файл {path}."));
+            }
+        };
+        if !file.metadata()?.is_file() {
+            diagnostics.non_regular_files += 1;
             record_safe_skipped_path(&mut diagnostics, &path);
             continue;
         }
@@ -156,19 +171,31 @@ pub fn load_project_corpus_with_diagnostics(project_root: &Path) -> Result<Loade
                 return Err(error).with_context(|| format!("Не удалось проверить файл {path}."));
             }
         };
-        if !fs::symlink_metadata(&canonical_path)?.file_type().is_file() {
-            diagnostics.non_regular_files += 1;
+        let opened_handle = Handle::from_file(
+            file.try_clone()
+                .with_context(|| format!("Не удалось проверить открытый файл {path}."))?,
+        )
+        .with_context(|| format!("Не удалось проверить открытый файл {path}."))?;
+        let path_handle = match Handle::from_path(&canonical_path) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                diagnostics.missing_files += 1;
+                record_safe_skipped_path(&mut diagnostics, &path);
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("Не удалось проверить путь {path}."));
+            }
+        };
+        if opened_handle != path_handle {
+            diagnostics.outside_root_files += 1;
             record_safe_skipped_path(&mut diagnostics, &path);
             continue;
         }
 
-        let bytes = fs::read(&canonical_path)
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
             .with_context(|| format!("Не удалось прочитать tracked-файл {path}."))?;
-        if bytes.len() > MAX_FILE_BYTES {
-            diagnostics.oversized_files += 1;
-            record_safe_skipped_path(&mut diagnostics, &path);
-            continue;
-        }
         if bytes.contains(&0) {
             diagnostics.binary_files += 1;
             record_safe_skipped_path(&mut diagnostics, &path);
@@ -192,10 +219,6 @@ pub fn load_project_corpus_with_diagnostics(project_root: &Path) -> Result<Loade
             continue;
         }
 
-        total_bytes = total_bytes.saturating_add(text.len());
-        if total_bytes > MAX_CORPUS_BYTES {
-            bail!("Допустимый текстовый corpus превышает лимит 16 MiB.");
-        }
         documents.push(SourceDocument { path, text });
     }
 
@@ -376,4 +399,51 @@ pub(crate) fn is_excluded_path(path: &str) -> bool {
 
 pub(crate) fn contains_secret_like_value(text: &str) -> bool {
     SECRET_PATTERNS.iter().any(|pattern| pattern.is_match(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CORPUS_FILES, load_project_corpus_with_diagnostics};
+    use std::{fs, process::Command};
+    use tempfile::tempdir;
+
+    #[test]
+    fn corpus_loader_accepts_10k_candidate_files_and_rejects_10k_plus_one() {
+        let fixture = tempdir().expect("temporary Git project is created");
+        let root = fixture.path();
+        let initialize = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .expect("Git initializes the fixture");
+        assert!(initialize.success());
+
+        for index in 0..=MAX_CORPUS_FILES {
+            fs::write(root.join(format!("file-{index:05}.txt")), "fixture\n")
+                .expect("tracked candidate is written");
+        }
+        let add = Command::new("git")
+            .args(["add", "--all"])
+            .current_dir(root)
+            .status()
+            .expect("Git stages the fixture candidates");
+        assert!(add.success());
+
+        let too_many = load_project_corpus_with_diagnostics(root)
+            .expect_err("10 001 tracked candidates exceed the configured limit");
+        assert!(too_many.to_string().contains("слишком много"));
+
+        let last_file = format!("file-{:05}.txt", MAX_CORPUS_FILES);
+        let remove = Command::new("git")
+            .args(["rm", "--cached", "--quiet", "--", &last_file])
+            .current_dir(root)
+            .status()
+            .expect("Git removes one fixture candidate from the index");
+        assert!(remove.success());
+
+        let corpus = load_project_corpus_with_diagnostics(root)
+            .expect("10 000 tracked candidates remain within the limit");
+        assert_eq!(corpus.diagnostics.tracked_regular_files, MAX_CORPUS_FILES);
+        assert_eq!(corpus.documents.len(), MAX_CORPUS_FILES);
+    }
 }

@@ -111,9 +111,11 @@ cargo run --manifest-path /path/to/developer-assistant/Cargo.toml -- \
 - Допустимый corpus повторяет фильтры PR reviewer: tracked regular files
   (Git modes `100644`/`100755`), без файлов под `.gitignore`, symlinks,
   generated/build/vendor-каталогов, minified/map/lock-файлов, secret-like paths,
-  binary/NUL, non-UTF-8 и empty files. Лимиты: 10 000 файлов, 256 KiB на файл,
-  16 MiB суммарно. Диагностика показывает причины пропусков и только safe path
-  examples. Фильтры и redaction — эвристики, не DLP.
+  binary/NUL, non-UTF-8 и empty files. Лимит: 10 000 файлов; per-file и aggregate
+  source-byte caps отсутствуют. D31 держит corpus/index в памяти, поэтому RAM и
+  время растут с объёмом. D32 отдельно сохраняет 256 MiB предел serialized embedding
+  cache. Диагностика показывает причины пропусков и только safe path examples.
+  Фильтры и redaction — эвристики, не DLP.
 - Локальный BM25 работает по исходникам, тестам, README, docs, схемам и другим
   допустимым tracked text files; Markdown headings влияют на ранжирование, но
   остаются метаданными, а не частью body excerpt. Vector DB и embeddings для `/help`
@@ -126,6 +128,13 @@ cargo run --manifest-path /path/to/developer-assistant/Cargo.toml -- \
 - Markdown sources выводятся как `path#heading` с фактически переданным диапазоном
   строк; остальные source files — как `path` с фактически переданным диапазоном.
   Source reference добавляется только после успешной сериализации tool result.
+- Ответ `/help` рендерится как Markdown: headings, emphasis, ordered/unordered
+  lists, inline/fenced code, links и tables. Таблицы шире терминала и все таблицы
+  со ссылками выводятся как строки «заголовок: значение» с переносом по ширине,
+  чтобы URL не ломали выравнивание. Остальной текст переносится по доступной ширине;
+  строки кода сохраняются без переноса и могут быть шире терминала. ANSI-оформление
+  включается только для TTY. URL ссылок всегда видны рядом с подписью; OSC8
+  hyperlinks не отправляются в терминал. Redirected output не содержит ANSI.
 - MCP subprocess не наследует переменные окружения с ключами настроенных providers.
 - Provider получает вопрос, ограниченный MCP-контекст, начальные passages и
   только запрошенные bounded tool results. Полный README, индекс и исходники

@@ -43,7 +43,9 @@ impl Embedder for FixtureEmbedder {
             .iter()
             .map(|text| {
                 let lower = text.to_lowercase();
-                let dimension = if lower.contains("transaction")
+                let dimension = if lower.contains("large_spec_end_marker") {
+                    2
+                } else if lower.contains("transaction")
                     || lower.contains("balance")
                     || lower.contains("settlement")
                 {
@@ -88,6 +90,7 @@ fn d32_review_filtered_rag() {
     assert!(paths.contains("README.md"));
     assert!(paths.contains("docs/architecture.md"));
     assert!(paths.contains("src/transaction.rs"));
+    assert!(paths.contains("docs/large-spec.md"));
     for excluded in [
         "ignored.txt",
         "src/config.rs",
@@ -98,7 +101,6 @@ fn d32_review_filtered_rag() {
         "src/google_config.rs",
         "build/generated.rs",
         "vendor/library.rs",
-        "oversized.txt",
         "src/binary.dat",
         "src/non-utf8.txt",
         "src/alias.rs",
@@ -121,6 +123,13 @@ fn d32_review_filtered_rag() {
         .collect::<HashSet<_>>();
     assert!(result_paths.contains("docs/architecture.md"));
     assert!(result_paths.contains("src/transaction.rs"));
+
+    let large_results = index
+        .search("LARGE_SPEC_END_MARKER", 8)
+        .expect("retrieval searches the full large document corpus");
+    assert!(large_results.iter().any(|result| {
+        result.path == "docs/large-spec.md" && result.text.contains("LARGE_SPEC_END_MARKER")
+    }));
     assert!(!result_paths.contains("ignored.txt"));
 
     let excerpt = index
@@ -297,7 +306,11 @@ fn project_fixture() -> TempDir {
     );
     write_text(root, "build/generated.rs", "generated transaction helper\n");
     write_text(root, "vendor/library.rs", "vendor transaction helper\n");
-    write_text(root, "oversized.txt", &"x".repeat(256 * 1024 + 1));
+    let mut large_spec = String::with_capacity(17 * 1024 * 1024 + 64);
+    large_spec.push_str("LARGE_SPEC_MARKER\n");
+    large_spec.extend(std::iter::repeat_n('x', 17 * 1024 * 1024));
+    large_spec.push_str("\nLARGE_SPEC_END_MARKER\n");
+    write_text(root, "docs/large-spec.md", &large_spec);
     fs::write(root.join("src/binary.dat"), [0_u8, 1, 2, 3, 4]).expect("binary fixture is written");
     fs::write(root.join("src/non-utf8.txt"), [0xff, 0xfe, 0x80])
         .expect("non-UTF8 fixture is written");

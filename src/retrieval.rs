@@ -729,7 +729,11 @@ mod tests {
         fs::write(root.path().join("empty.txt"), "").unwrap();
         fs::write(root.path().join("binary.dat"), [b'x', 0, b'y']).unwrap();
         fs::write(root.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
-        fs::write(root.path().join("large.txt"), vec![b'x'; 256 * 1024 + 1]).unwrap();
+        let mut large_spec = String::with_capacity(17 * 1024 * 1024 + 64);
+        large_spec.push_str("LARGE_SPEC_MARKER\n");
+        large_spec.extend(std::iter::repeat_n('x', 17 * 1024 * 1024));
+        large_spec.push_str("\nLARGE_SPEC_END_MARKER\n");
+        fs::write(root.path().join("docs/large-spec.md"), large_spec).unwrap();
         fs::write(
             root.path().join("target/generated.rs"),
             "generated source\n",
@@ -748,7 +752,7 @@ mod tests {
                 "empty.txt",
                 "binary.dat",
                 "invalid.txt",
-                "large.txt",
+                "docs/large-spec.md",
                 "target/generated.rs",
             ],
         );
@@ -770,6 +774,13 @@ mod tests {
                 && result.passage.start_line == 2
                 && result.excerpt.contains("unique_schema_marker")
         }));
+
+        let large = index.search("LARGE_SPEC_END_MARKER", 8);
+        assert!(large.iter().any(|result| {
+            result.passage.source_path == "docs/large-spec.md"
+                && result.excerpt.contains("LARGE_SPEC_END_MARKER")
+        }));
+
         assert!(index.read_file("ignored.txt", 1, 1).is_err());
         assert!(index.read_file("untracked.txt", 1, 1).is_err());
         assert!(index.read_file("secrets/api-token.txt", 1, 1).is_err());
@@ -780,13 +791,12 @@ mod tests {
         assert_eq!(summary.diagnostics.empty_files, 1);
         assert_eq!(summary.diagnostics.binary_files, 1);
         assert_eq!(summary.diagnostics.non_utf8_files, 1);
-        assert_eq!(summary.diagnostics.oversized_files, 1);
         assert!(!summary.diagnostics.safe_skipped_paths.iter().any(
             |path| path.contains("api-token")
                 || path.contains("sensitive")
                 || path == "ignored.txt"
         ));
-        assert_eq!(summary.diagnostics.skipped_files(), 8);
+        assert_eq!(summary.diagnostics.skipped_files(), 7);
     }
 
     #[test]

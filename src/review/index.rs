@@ -247,6 +247,22 @@ fn load_cached_passages(
 }
 
 fn save_cache(cache_path: &Path, corpus_fingerprint: &str, passages: &[Passage]) -> Result<()> {
+    save_cache_with_limit(
+        cache_path,
+        corpus_fingerprint,
+        passages,
+        MAX_CACHE_BYTES,
+        "256 MiB",
+    )
+}
+
+fn save_cache_with_limit(
+    cache_path: &Path,
+    corpus_fingerprint: &str,
+    passages: &[Passage],
+    max_bytes: u64,
+    max_bytes_label: &str,
+) -> Result<()> {
     let cache = CachedIndex {
         schema_version: INDEX_SCHEMA_VERSION,
         model: MODEL_ID.to_owned(),
@@ -255,8 +271,8 @@ fn save_cache(cache_path: &Path, corpus_fingerprint: &str, passages: &[Passage])
     };
     let bytes =
         serde_json::to_vec(&cache).context("Не удалось сериализовать локальный review index.")?;
-    if bytes.len() as u64 > MAX_CACHE_BYTES {
-        bail!("Сериализованный review index превышает лимит 256 MiB.");
+    if bytes.len() as u64 > max_bytes {
+        bail!("Сериализованный review index превышает лимит {max_bytes_label}.");
     }
 
     let parent = cache_path
@@ -324,4 +340,23 @@ fn hex_digest(digest: &[u8]) -> String {
         let _ = write!(output, "{byte:02x}");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_CACHE_BYTES, save_cache_with_limit};
+    use tempfile::tempdir;
+
+    #[test]
+    fn serialized_cache_respects_limit() {
+        assert_eq!(MAX_CACHE_BYTES, 256 * 1024 * 1024);
+        let directory = tempdir().expect("temporary directory is created");
+        let cache_path = directory.path().join("review-index.json");
+
+        let error = save_cache_with_limit(&cache_path, "fixture", &[], 1, "test limit")
+            .expect_err("oversized serialized cache is rejected");
+
+        assert!(error.to_string().contains("test limit"));
+        assert!(!cache_path.exists(), "oversized cache is not written");
+    }
 }

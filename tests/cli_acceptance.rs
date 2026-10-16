@@ -18,6 +18,24 @@ const TEST_API_KEY: &str = "local-test-key-not-a-credential";
 const STRUCTURE_QUESTION: &str =
     "Какие Gradle-модули есть, где web entry point и что описывает schema transaction-import.v3?";
 const STRUCTURE_ANSWER: &str = "Проект делится на core, transport, persistence и web; основной интерфейс — GET /agent; schema transaction-import.v3 описывает импорт операций.";
+const MARKDOWN_ANSWER: &str = r#"# D31 preview
+
+**Bold** and *italic*.
+
+- unordered item
+1. ordered item
+
+Inline `component()`.
+
+```rust
+fn render() {}
+```
+
+[Project docs](https://example.test/docs)
+
+| Item | State |
+| --- | --- |
+| renderer | ready |"#;
 struct CapturedRequest {
     request_line: String,
     body: Vec<u8>,
@@ -102,6 +120,113 @@ async fn help_uses_docs_and_live_mcp_context() {
     assert!(prompt.contains("[docs/architecture.md#"));
     assert!(prompt.contains("core"));
     assert!(!prompt.contains(TEST_API_KEY));
+}
+
+#[tokio::test]
+async fn help_renders_markdown_in_one_shot_cli() {
+    let fixture = git_project_with_docs(
+        "# Overview\nThe read-only project interface is available for structure questions.",
+        "# Architecture\nThe service exposes a local interface.",
+    );
+    let (base_url, fake_provider) =
+        start_provider("200 OK", completion_response(MARKDOWN_ANSWER)).await;
+
+    let output = run_cli(
+        fixture.path(),
+        "Что описывает интерфейс проекта?",
+        Some(&base_url),
+        Some(TEST_API_KEY),
+    )
+    .await;
+    if !output.status.success() {
+        fake_provider.abort();
+        panic!("CLI failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let _request = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("one-shot CLI did not call fake provider")
+        .expect("fake provider task completed");
+
+    assert_readable_markdown_answer(&String::from_utf8_lossy(&output.stdout));
+}
+
+#[tokio::test]
+async fn help_renders_markdown_in_repl() {
+    let fixture = git_project_with_docs(
+        "# Overview\nThe read-only project interface is available for structure questions.",
+        "# Architecture\nThe service exposes a local interface.",
+    );
+    let (base_url, fake_provider) =
+        start_provider("200 OK", completion_response(MARKDOWN_ANSWER)).await;
+    let config_directory = TempDir::new().expect("temporary config directory");
+    let config_path = config_directory.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!(
+            "[providers.test]\nbase_url = \"{base_url}\"\napi_key_env = \"DEVELOPER_ASSISTANT_API_KEY\"\nmodels = [\"test-model\"]\n\n[selection]\ndefault_model = \"test/test-model\"\n"
+        ),
+    )
+    .expect("provider catalog is written");
+
+    let output = run_repl(
+        fixture.path(),
+        &config_path,
+        None,
+        "/help Что описывает интерфейс проекта?\n/exit\n",
+        &[("DEVELOPER_ASSISTANT_API_KEY", TEST_API_KEY)],
+    )
+    .await;
+    if !output.status.success() {
+        fake_provider.abort();
+        panic!("REPL failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    let _request = timeout(Duration::from_secs(5), fake_provider)
+        .await
+        .expect("REPL did not call fake provider")
+        .expect("fake provider task completed");
+
+    assert_readable_markdown_answer(&String::from_utf8_lossy(&output.stdout));
+}
+
+fn assert_readable_markdown_answer(stdout: &str) {
+    let answer = stdout
+        .split_once("Ответ:\n")
+        .expect("answer section is printed")
+        .1
+        .split_once("\n\nToken budget:")
+        .expect("token diagnostics follow the answer")
+        .0;
+    for visible in [
+        "D31 preview",
+        "Bold",
+        "italic",
+        "unordered item",
+        "ordered item",
+        "component()",
+        "fn render() {}",
+        "Project docs",
+        "https://example.test/docs",
+        "renderer",
+        "ready",
+    ] {
+        assert!(
+            answer.contains(visible),
+            "missing rendered content: {visible}"
+        );
+    }
+    assert!(!answer.contains("##"));
+    assert!(!answer.contains("**"));
+    assert!(!answer.contains("```"));
+    assert!(!answer.contains("| Item |"));
+    assert!(!answer.contains("[Project docs]"));
+    assert!(!stdout.contains('\u{1b}'));
+    assert!(
+        stdout
+            .split_once("\n\nToken budget:")
+            .expect("diagnostics follow answer")
+            .1
+            .contains("Источники:")
+    );
 }
 
 #[tokio::test]
