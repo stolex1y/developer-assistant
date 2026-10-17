@@ -12,6 +12,7 @@ const MAX_RENDERED_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_DETAIL_BYTES: usize = 2 * 1024;
 const MAX_EVIDENCE_BYTES: usize = 1024;
 const MAX_INLINE_FENCE: usize = 16;
+const SUMMARY_DISCLAIMER: &str = "AI-резюме не проверяется отдельно. У findings сверяются path/evidence с diff; смысл замечаний требует ручной оценки.";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -175,8 +176,9 @@ pub fn render_finding_comment(finding: &ReviewFinding) -> Result<String> {
 
 pub fn render_summary(report: &ReviewReport, head_sha: &str) -> Result<String> {
     let mut output = format!(
-        "{SUMMARY_MARKER}\n\n# AI code review\n\n**Head:** `{}`\n\n{}\n",
+        "{SUMMARY_MARKER}\n\n# AI code review\n\n**Head:** `{}`\n\n> **Ограничение:** {}\n\n{}\n",
         markdown_escape(head_sha),
+        SUMMARY_DISCLAIMER,
         markdown_escape(&report.summary)
     );
     for category in [

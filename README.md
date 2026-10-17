@@ -195,9 +195,23 @@ tool-enabled запросов; usage финального запроса без 
 останавливают review без публикации.
 
 В целевом GitHub repository задайте Actions secret `DEEPSEEK_API_KEY`.
-`GITHUB_TOKEN` workflow получает автоматически с `contents: read` и
-`pull-requests: write`. Утилита запускается при `opened`, `reopened` и
-`synchronize`; результат — PR summary и обновляемые inline threads.
+`GITHUB_TOKEN` workflow получает автоматически с `contents: write` и
+`pull-requests: write`: первое разрешение даёт job техническую возможность менять
+содержимое репозитория, второе требуется для PR comments и разрешения review threads.
+Утилита сама не выполняет commit, push или merge.
+Workflow запускается при `opened`, `reopened` и `synchronize`; результат — PR summary
+и обновляемые inline threads.
+
+В PR summary и inline comments попадают findings с path и evidence, подтверждёнными
+diff. Для добавленных/изменённых файлов evidence берётся из added/current-side; для
+удалённых допустимо removed-side evidence только при регрессии от удаления, и такой
+finding выводится только в summary без inline anchor. Неподтверждённые findings
+исключаются; summary показывает их число. Их исключение не блокирует отдельные
+resolutions: прежний thread закрывается только при совпадении fingerprint/path и
+evidence в добавленном коде.
+
+Краткое AI-резюме не проверяется отдельно. У findings сверяются path/evidence с diff;
+смысл замечаний требует ручной оценки.
 
 **Граница доверия:** включайте этот workflow только для репозитория, где
 пользователям с правом менять workflows можно доверять repository secrets.

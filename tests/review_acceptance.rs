@@ -606,6 +606,8 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
     let findings = review_findings();
     let finding = &findings[0];
     let fingerprint = finding_fingerprint(finding);
+    let mut unsupported_finding = finding.clone();
+    unsupported_finding.evidence = "    old_unverified_balance_check();".to_owned();
     let tool_call = json!({
         "id": "call_initial_rag",
         "type": "function",
@@ -632,9 +634,9 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
             &findings,
             Vec::new(),
         )),
-        deepseek_review_response(review_report(
-            "В новом head добавлена проверка баланса до расчета.",
-            None,
+        deepseek_review_response(review_report_many(
+            "The unverified finding must not leak into the published summary.",
+            &[unsupported_finding],
             vec![json!({
                 "fingerprint": fingerprint,
                 "path": "src/transaction.rs",
@@ -797,6 +799,10 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
     );
     assert_eq!(github_state.threads.len(), 4);
     assert_eq!(github_state.summaries.len(), 1);
+    let updated_summary = &github_state.summaries[0].body;
+    assert!(updated_summary.contains("Неподтверждённые findings не опубликованы"));
+    assert!(!updated_summary.contains("The unverified finding must not leak"));
+    assert!(updated_summary.contains("AI-резюме не проверяется отдельно."));
     assert!(
         github_state
             .threads
@@ -829,6 +835,7 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
     ] {
         assert!(first_summary.contains(heading));
     }
+    assert!(first_summary.contains("AI-резюме не проверяется отдельно."));
     assert_eq!(
         github_state
             .requests
