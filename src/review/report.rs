@@ -1,5 +1,5 @@
 use crate::review::corpus::contains_secret_like_value;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -53,8 +53,19 @@ pub struct ResolvedFinding {
 
 impl ReviewReport {
     pub fn parse(content: &str) -> Result<Self> {
-        let report: Self = serde_json::from_str(content)
-            .context("DeepSeek review JSON не соответствует report contract.")?;
+        let report: Self = serde_json::from_str(content).map_err(|error| {
+            let category = match error.classify() {
+                serde_json::error::Category::Io => "I/O",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "incomplete JSON",
+            };
+            anyhow::anyhow!(
+                "DeepSeek review JSON не соответствует report contract: {category}, line {}, column {}.",
+                error.line(),
+                error.column()
+            )
+        })?;
         report.validate()?;
         Ok(report)
     }
@@ -367,5 +378,16 @@ mod tests {
         );
         assert!(summary.contains(r"**Файл:** `src/deleted\.rs`"));
         assert!(!summary.contains(r"src/deleted\.rs:"));
+    }
+
+    #[test]
+    fn report_parse_diagnostic_does_not_echo_model_content() {
+        let raw = r#"{"summary":"synthetic-model-body-marker","findings":[]}"#;
+        let error = ReviewReport::parse(raw).expect_err("required fields are missing");
+        let diagnostic = error.to_string();
+
+        assert!(diagnostic.contains("data"));
+        assert!(diagnostic.contains("line"));
+        assert!(!diagnostic.contains("synthetic-model-body-marker"));
     }
 }

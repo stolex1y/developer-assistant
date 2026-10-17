@@ -1212,6 +1212,161 @@ async fn d32_review_secret_like_model_output_is_rejected_before_github_writes() 
     );
 }
 #[tokio::test]
+async fn d32_review_truncated_completion_fails_before_github_writes() {
+    let fixture = review_project_fixture();
+    let root = fixture.path();
+    let base_sha = "b".repeat(40);
+    let head_sha = git_head(root);
+    let patch = "@@ -0,0 +1,3 @@\n+pub fn calculate() {\n+    calculate_transaction_total();\n+}\n";
+    let (github_url, github_server, control) =
+        mock_github_server(base_sha.clone(), head_sha.clone(), patch.to_owned(), None).await;
+    let (deepseek_url, deepseek_server) = scripted_http(vec![deepseek_response(
+        "length",
+        json!({"role":"assistant","content":r#"{"summary":"partial"#}),
+        1_000,
+        700,
+        300,
+    )])
+    .await;
+    let runner = ReviewRunner::new(
+        GitHubClient::new(github_url, "synthetic-github-token".to_owned()).unwrap(),
+        DeepSeekClient::new(
+            deepseek_url,
+            "synthetic-deepseek-key".to_owned(),
+            "deepseek-flash".to_owned(),
+        )
+        .unwrap(),
+    );
+    let identity = PullRequestId {
+        owner: "acme".to_owned(),
+        repository: "transaction-import".to_owned(),
+        number: 7,
+        expected_base_sha: base_sha,
+        expected_head_sha: head_sha,
+    };
+    let mut index = ReviewIndex::open(
+        root,
+        &root.join(".data/review-truncated/index"),
+        FixtureEmbedder::default(),
+    )
+    .expect("synthetic corpus indexes");
+
+    let error = runner
+        .run_with_index(root, &identity, 10_000, &mut index)
+        .await
+        .expect_err("incomplete completion must stop before publishing");
+    assert!(error.to_string().contains("finish_reason=length"));
+    assert_eq!(
+        deepseek_server
+            .await
+            .expect("fake DeepSeek handled the incomplete completion")
+            .len(),
+        1
+    );
+    control.send(MockGithubControl::Shutdown).unwrap();
+    let github_state = github_server.await.unwrap();
+
+    assert!(github_state.threads.is_empty());
+    assert!(github_state.summaries.is_empty());
+    assert_eq!(
+        github_state
+            .requests
+            .iter()
+            .filter(|request| {
+                request.method == "PATCH"
+                    || (request.method == "POST"
+                        && (request.path.ends_with("/pulls/7/comments")
+                            || request.path.ends_with("/issues/7/comments")
+                            || request.body["query"]
+                                .as_str()
+                                .is_some_and(|query| query.contains("resolveReviewThread"))))
+            })
+            .count(),
+        0,
+        "incomplete completion performs no GitHub write"
+    );
+}
+
+#[tokio::test]
+async fn d32_review_malformed_report_fails_before_github_writes() {
+    let fixture = review_project_fixture();
+    let root = fixture.path();
+    let base_sha = "b".repeat(40);
+    let head_sha = git_head(root);
+    let patch = "@@ -0,0 +1,3 @@\n+pub fn calculate() {\n+    calculate_transaction_total();\n+}\n";
+    let (github_url, github_server, control) =
+        mock_github_server(base_sha.clone(), head_sha.clone(), patch.to_owned(), None).await;
+    let marker = "synthetic-model-body-marker";
+    let (deepseek_url, deepseek_server) = scripted_http(vec![deepseek_response(
+        "stop",
+        json!({
+            "role": "assistant",
+            "content": format!(r#"{{"summary":"{marker}","findings":[]}}"#)
+        }),
+        1_000,
+        700,
+        300,
+    )])
+    .await;
+    let runner = ReviewRunner::new(
+        GitHubClient::new(github_url, "synthetic-github-token".to_owned()).unwrap(),
+        DeepSeekClient::new(
+            deepseek_url,
+            "synthetic-deepseek-key".to_owned(),
+            "deepseek-flash".to_owned(),
+        )
+        .unwrap(),
+    );
+    let identity = PullRequestId {
+        owner: "acme".to_owned(),
+        repository: "transaction-import".to_owned(),
+        number: 7,
+        expected_base_sha: base_sha,
+        expected_head_sha: head_sha,
+    };
+    let mut index = ReviewIndex::open(
+        root,
+        &root.join(".data/review-malformed/index"),
+        FixtureEmbedder::default(),
+    )
+    .expect("synthetic corpus indexes");
+
+    let error = runner
+        .run_with_index(root, &identity, 10_000, &mut index)
+        .await
+        .expect_err("report missing a required field must be rejected");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("data"));
+    assert!(diagnostic.contains("line"));
+    assert!(!diagnostic.contains(marker));
+    let _ = deepseek_server
+        .await
+        .expect("fake DeepSeek handled malformed report");
+    control.send(MockGithubControl::Shutdown).unwrap();
+    let github_state = github_server.await.unwrap();
+
+    assert!(github_state.threads.is_empty());
+    assert!(github_state.summaries.is_empty());
+    assert_eq!(
+        github_state
+            .requests
+            .iter()
+            .filter(|request| {
+                request.method == "PATCH"
+                    || (request.method == "POST"
+                        && (request.path.ends_with("/pulls/7/comments")
+                            || request.path.ends_with("/issues/7/comments")
+                            || request.body["query"]
+                                .as_str()
+                                .is_some_and(|query| query.contains("resolveReviewThread"))))
+            })
+            .count(),
+        0,
+        "malformed report performs no GitHub write"
+    );
+}
+
+#[tokio::test]
 async fn d32_review_missing_usage_fails_closed_before_returning_model_content() {
     let responses = vec![json!({
         "choices": [{

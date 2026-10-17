@@ -28,7 +28,25 @@ const SYSTEM_PROMPT: &str = r#"
 
 Используй начальные RAG passages и read-only tools search_code/read_file для проверки связанных контрактов и кода. Замечания должны относиться к изменённому поведению и опираться на точную цитату из diff: для добавленных/изменённых файлов — на added/current-side, для удалённых — на removed-side только при регрессии, вызванной удалением. Для удалённого файла укажи line=null; renderer явно помечает removed-side evidence, а finding публикуется только в summary. Не выдумывай факты, не повторяй нерешённые прежние замечания без нового основания. Рекомендации без подтверждённой проблемы допускаются в категории recommendation.
 
-Верни только JSON object по схеме: {"summary":"краткий итог только по текущему diff","findings":[{"category":"bug|architecture|recommendation","title":"...","detail":"...","path":"...","line":123,"evidence":"точный фрагмент diff по правилам выше"}],"resolved_findings":[{"fingerprint":"16 hex chars из active_prior_findings","path":"точное значение path из active_prior_findings","evidence":"точный новый фрагмент, подтверждающий исправление"}]}. Все поля обязательны; line — positive integer или null.
+Верни только JSON object по report contract. Обязательны ровно эти top-level fields: `summary` (string), `findings` (array), `resolved_findings` (array). Для каждого finding обязательны `category`, `title`, `detail`, `path`, `line`, `evidence`; `line` — positive integer или `null`. Допустимые `category`: ровно `bug`, `architecture`, `recommendation`.
+Каждый `resolved_findings` entry содержит ровно `fingerprint` (16 hex chars из `active_prior_findings`), `path` (точное значение из `active_prior_findings`) и `evidence` (точный новый added-side фрагмент, присутствующий в diff и индексе).
+
+Пример валидного JSON (значения illustrative; не копируй path/evidence/line, подставляй проверенные данные PR):
+{
+  "summary": "Проверка diff завершена.",
+  "findings": [
+    {
+      "category": "bug",
+      "title": "Пример заголовка",
+      "detail": "Пример описания подтверждённой проблемы.",
+      "path": "src/example.kt",
+      "line": 1,
+      "evidence": "точный фрагмент из diff"
+    }
+  ],
+  "resolved_findings": []
+}
+При отсутствии findings или resolutions всё равно возвращай соответствующие обязательные поля с пустыми массивами. Не добавляй Markdown fences, комментарии, дополнительные top-level fields или значения category вне трёх перечисленных.
 Не объявляй finding разрешённым без нового точного evidence; клиент независимо проверит path, fingerprint и содержимое текущего diff/head.
 Оцени отдельно каждый active_prior_finding из JSON context. Если его проблема исправлена, обязательно добавь соответствующий resolved_findings entry: скопируй fingerprint и path побайтно из JSON, evidence — точную подстроку added-side, которая также присутствует в текущем индексированном файле. Одного текста в summary недостаточно: не утверждай там, что прежнее замечание исправлено или сохраняется; summary описывает только текущий diff. Если проблема сохраняется и diff подтверждает её, верни finding с точным evidence; если решение нельзя подтвердить текущим diff, не разрешай thread. Не пропускай включённый prior finding без оценки. Secret-like comment bodies намеренно не передаются модели. Неподтверждённый candidate пропусти, не отказываясь из-за него от других подтверждённых findings/resolutions.
 Если подтверждений нет, верни пустые массивы и опиши только проверенный результат текущего diff.

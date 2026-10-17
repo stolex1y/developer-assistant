@@ -197,12 +197,11 @@ impl DeepSeekClient {
         loop {
             let completion = self.request(&messages, true).await?;
             requests = requests.saturating_add(1);
+            let choice = first_choice(completion.choices)?;
             let usage = valid_usage(completion.usage)?;
             uncached_input_tokens = uncached_input_tokens
                 .checked_add(usage.uncached_input_tokens)
                 .context("Сумма uncached input tokens переполнена.")?;
-
-            let choice = first_choice(completion.choices)?;
             let tool_calls = choice.message.tool_calls;
             if !tool_calls.is_empty() && usage.uncached_input_tokens == 0 {
                 bail!(
@@ -361,6 +360,11 @@ fn first_choice(choices: Vec<Choice>) -> Result<Choice> {
         .into_iter()
         .next()
         .context("DeepSeek не вернул completion choice.")?;
+    if choice.finish_reason == "length" {
+        bail!(
+            "DeepSeek завершил ответ с finish_reason=length; completion неполный, review остановлен."
+        );
+    }
     if choice.finish_reason == "content_filter"
         || choice.finish_reason == "insufficient_system_resource"
     {
