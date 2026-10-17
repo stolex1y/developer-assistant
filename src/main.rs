@@ -57,6 +57,15 @@ async fn run() -> anyhow::Result<()> {
             .await
             .map(print_result)
         }
+        Some(Action::Task { goal }) => {
+            developer_assistant::task::run_task(
+                &project_root,
+                &goal.join(" "),
+                &config,
+                selected_model.as_deref(),
+            )
+            .await
+        }
         Some(Action::Review {
             repository,
             pr_number,

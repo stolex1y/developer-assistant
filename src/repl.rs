@@ -2,6 +2,7 @@ use crate::{
     assistant::{answer_question, escape_terminal_field, print_result},
     config::{UserConfig, example_config_path},
     retrieval::ProjectIndex,
+    task::run_task_with_confirmation,
 };
 use anyhow::{Result, anyhow};
 use rustyline::{
@@ -14,14 +15,16 @@ use rustyline::{
 };
 use std::path::Path;
 
-const COMMANDS: [&str; 4] = ["/help", "/models", "/model", "/exit"];
+const COMMANDS: [&str; 5] = ["/help", "/task", "/models", "/model", "/exit"];
 
 pub async fn run(
     project_root: &Path,
     config: &mut UserConfig,
     mut active_model: Option<String>,
 ) -> Result<()> {
-    println!("Ассистент разработчика. Команды: /models, /model, /help <вопрос>, /exit.");
+    println!(
+        "Ассистент разработчика. Команды: /models, /model, /help <вопрос>, /task <цель>, /exit."
+    );
     if config.models().next().is_none() {
         println!(
             "Каталог моделей пуст. Config: {}. Пример: {}.",
@@ -69,6 +72,28 @@ pub async fn run(
             print_models(config, active_model.as_deref());
             continue;
         }
+        if let Some(goal) = task_goal(command) {
+            if goal.is_empty() {
+                println!("Использование: /task <цель>");
+                continue;
+            }
+            let result = run_task_with_confirmation(
+                project_root,
+                goal,
+                config,
+                active_model.as_deref(),
+                |prompt| match editor.readline(prompt) {
+                    Ok(answer) => Ok(Some(answer)),
+                    Err(ReadlineError::Interrupted | ReadlineError::Eof) => Ok(None),
+                    Err(error) => Err(anyhow!("Не удалось прочитать подтверждение: {error}")),
+                },
+            )
+            .await;
+            if let Err(error) = result {
+                eprintln!("Ошибка: {}", escape_terminal_field(&error.to_string()));
+            }
+            continue;
+        }
         if let Some(question) = help_question(command) {
             if question.is_empty() {
                 println!("Использование: /help <вопрос>");
@@ -108,7 +133,7 @@ pub async fn run(
             }
             continue;
         }
-        println!("Неизвестная команда. Используйте /models, /model, /help или /exit.");
+        println!("Неизвестная команда. Используйте /models, /model, /help, /task или /exit.");
     }
     Ok(())
 }
@@ -220,8 +245,17 @@ fn help_question(line: &str) -> Option<&str> {
     }
     Some(rest.trim())
 }
+
+fn task_goal(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("/task")?;
+    if !rest.is_empty() && !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.trim())
+}
 fn history_entry(line: &str) -> Option<&str> {
     help_question(line)
+        .or_else(|| task_goal(line))
         .filter(|question| !question.is_empty())
         .map(|_| line)
 }
@@ -268,12 +302,18 @@ mod tests {
     }
 
     #[test]
-    fn only_nonempty_help_questions_enter_session_history() {
+    fn only_nonempty_goals_and_help_questions_enter_session_history() {
         assert_eq!(
             history_entry("/help как устроен проект?"),
             Some("/help как устроен проект?")
         );
         assert_eq!(history_entry("/help"), None);
+        assert_eq!(
+            history_entry("/task update source and docs"),
+            Some("/task update source and docs")
+        );
+        assert_eq!(history_entry("/task"), None);
+        assert_eq!(history_entry("/taskforce update"), None);
         assert_eq!(history_entry("/models"), None);
         assert_eq!(history_entry("/model deepseek/model"), None);
         assert_eq!(history_entry("/exit"), None);

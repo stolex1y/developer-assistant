@@ -3,7 +3,7 @@ name = "developer-assistant"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Локальный read-only ассистент проекта по README и docs"
+description = "Ассистент проекта: ответы по документации, review и файловые задачи с подтверждением diff"
 
 [dependencies]
 anyhow = "1"

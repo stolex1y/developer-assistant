@@ -48,6 +48,46 @@ static HELP_TOOLS: LazyLock<Vec<Value>> = LazyLock::new(|| {
     ]
 });
 
+static TASK_TOOLS: LazyLock<Vec<Value>> = LazyLock::new(|| {
+    let definitions = [
+        (
+            "list_files",
+            "List allowed project paths; follow next_offset while truncated.",
+            json!({"offset": {"type": "integer", "minimum": 0}}),
+            Vec::<&str>::new(),
+        ),
+        (
+            "search_text",
+            "Literal search across allowed project files; results may be truncated.",
+            json!({"query": {"type": "string", "minLength": 1}}),
+            vec!["query"],
+        ),
+        (
+            "read_file",
+            "Read at most 200 lines and 32768 JSON bytes; use smaller ranges if needed. Read every line before proposing an existing file.",
+            json!({"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}}),
+            vec!["path", "start_line", "end_line"],
+        ),
+        (
+            "propose_file",
+            "Stage complete UTF-8 content, without writing to disk.",
+            json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+            vec!["path", "content"],
+        ),
+    ];
+    definitions
+        .into_iter()
+        .map(|(name, description, properties, required)| {
+            json!({
+                "type": "function",
+                "function": {"name": name, "description": description,
+                    "parameters": {"type": "object", "properties": properties,
+                        "required": required, "additionalProperties": false}}
+            })
+        })
+        .collect()
+});
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputTokenUsage {
     pub prompt_tokens: u64,
@@ -211,6 +251,45 @@ pub async fn tool_loop(
     tools: &mut impl ToolExecutor,
     max_uncached_input_tokens: u64,
 ) -> Result<ToolLoopResult> {
+    tool_loop_with_schema(
+        config,
+        system_prompt,
+        user_prompt,
+        tools,
+        max_uncached_input_tokens,
+        HELP_TOOLS.as_slice(),
+        false,
+    )
+    .await
+}
+
+pub async fn task_tool_loop(
+    config: &crate::config::ProviderConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    tools: &mut impl ToolExecutor,
+) -> Result<ToolLoopResult> {
+    tool_loop_with_schema(
+        config,
+        system_prompt,
+        user_prompt,
+        tools,
+        30_000,
+        TASK_TOOLS.as_slice(),
+        true,
+    )
+    .await
+}
+
+async fn tool_loop_with_schema(
+    config: &crate::config::ProviderConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    tools: &mut impl ToolExecutor,
+    max_uncached_input_tokens: u64,
+    schema: &'static [Value],
+    strict: bool,
+) -> Result<ToolLoopResult> {
     if max_uncached_input_tokens == 0 {
         bail!("Лимит uncached input tokens должен быть больше нуля.");
     }
@@ -233,13 +312,16 @@ pub async fn tool_loop(
     let mut requests = 0_u64;
 
     loop {
-        let completion = request(config, &http, &messages, true).await?;
+        let completion = request(config, &http, &messages, true, schema).await?;
         requests = requests.saturating_add(1);
         let usage = parse_input_usage(completion.usage, "Provider")?;
         uncached_input_tokens = uncached_input_tokens
             .checked_add(usage.uncached_input_tokens)
             .context("Сумма uncached input tokens переполнена.")?;
         let choice = first_choice(completion.choices)?;
+        if strict && !matches!(choice.finish_reason.as_deref(), Some("stop" | "tool_calls")) {
+            bail!("Неполный или некорректный ответ /task; изменения отменены.");
+        }
         let tool_calls = choice.message.tool_calls;
         if tool_calls.is_empty() {
             let content = choice
@@ -272,10 +354,13 @@ pub async fn tool_loop(
                     }),
                 )?);
             }
-            let completion = request(config, &http, &messages, false).await?;
+            let completion = request(config, &http, &messages, false, schema).await?;
             requests = requests.saturating_add(1);
             let final_usage = parse_input_usage(completion.usage, "Provider")?;
             let choice = first_choice(completion.choices)?;
+            if strict && choice.finish_reason.as_deref() != Some("stop") {
+                bail!("Неполный финальный ответ /task; изменения отменены.");
+            }
             if !choice.message.tool_calls.is_empty() {
                 bail!("Provider вернул tool call в финальном запросе без tools.");
             }
@@ -301,7 +386,13 @@ pub async fn tool_loop(
                     "error": "duplicate_tool_call",
                     "message": "This exact tool call was already attempted; use new evidence or provide the final answer."
                 }))
-            } else if call.function.arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+            } else if call.function.arguments.len()
+                > if strict {
+                    MAX_RESPONSE_BYTES
+                } else {
+                    MAX_TOOL_ARGUMENT_BYTES
+                }
+            {
                 Err(json!({
                     "error": "tool_arguments_too_large",
                     "message": "Tool arguments exceeded the size limit and were not executed."
@@ -311,6 +402,11 @@ pub async fn tool_loop(
                     Ok(arguments) => match tools.execute(&call.function.name, arguments) {
                         Ok(result) => {
                             tool_calls_executed = tool_calls_executed.saturating_add(1);
+                            if strict && call.function.name == "propose_file" {
+                                // Discovery now observes a new staging view, not the old result.
+                                seen_tool_calls
+                                    .retain(|signature| signature.starts_with("propose_file\0"));
+                            }
                             Ok(result)
                         }
                         Err(_) => Err(json!({
@@ -324,6 +420,14 @@ pub async fn tool_loop(
                     })),
                 }
             };
+            if strict
+                && (result.is_err()
+                    || result
+                        .as_ref()
+                        .is_ok_and(|content| content.len() > MAX_TOOL_RESULT_BYTES))
+            {
+                bail!("Ошибка инструмента /task; изменения отменены.");
+            }
             let message = match result {
                 Ok(content) => tool_result_content(call.id, content),
                 Err(error) => tool_result(call.id, error)?,
@@ -338,13 +442,14 @@ async fn request(
     http: &Client,
     messages: &[ChatMessage],
     tools_enabled: bool,
+    schema: &'static [Value],
 ) -> Result<ChatCompletionResponse> {
     let request = ChatCompletionRequest {
         model: config.model(),
         messages,
         temperature: 0.0,
         max_tokens: MAX_COMPLETION_TOKENS,
-        tools: tools_enabled.then_some(HELP_TOOLS.as_slice()),
+        tools: tools_enabled.then_some(schema),
         tool_choice: if tools_enabled { "auto" } else { "none" },
     };
     let response = http
@@ -432,6 +537,24 @@ async fn bounded_body(mut response: Response) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn task_schema_does_not_expand_help_write_boundary() {
+        let names = |tools: &[serde_json::Value]| {
+            tools
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(super::HELP_TOOLS.as_slice()),
+            ["search_code", "read_file"]
+        );
+        assert_eq!(
+            names(super::TASK_TOOLS.as_slice()),
+            ["list_files", "search_text", "read_file", "propose_file"]
+        );
+    }
+
     use super::{InputTokenUsage, ToolExecutor, parse_input_usage, tool_loop};
     use crate::config::ProviderConfig;
     use anyhow::Result;

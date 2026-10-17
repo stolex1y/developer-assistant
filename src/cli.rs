@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "developer-assistant",
     version,
-    about = "Read-only ассистент с обновляемым RAG по tracked-файлам проекта и актуальным Git-контекстом",
+    about = "Ассистент разработчика: read-only /help и изменения по цели /task с подтверждением diff",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -28,6 +28,14 @@ pub enum Action {
     Help {
         #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
         question: Vec<String>,
+    },
+    #[command(
+        name = "/task",
+        about = "Предложить изменения по цели; применить только после подтверждения diff"
+    )]
+    Task {
+        #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
+        goal: Vec<String>,
     },
     #[command(name = "__mcp-server", hide = true)]
     McpServer,

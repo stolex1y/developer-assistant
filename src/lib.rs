@@ -7,3 +7,5 @@ pub mod provider;
 pub mod repl;
 pub mod retrieval;
 pub mod review;
+pub mod task;
+pub mod task_files;
