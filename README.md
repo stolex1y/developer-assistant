@@ -203,12 +203,19 @@ Workflow запускается при `opened`, `reopened` и `synchronize`; р
 и обновляемые inline threads.
 
 В PR summary и inline comments попадают findings с path и evidence, подтверждёнными
-diff. Для добавленных/изменённых файлов evidence берётся из added/current-side; для
-удалённых допустимо removed-side evidence только при регрессии от удаления, и такой
-finding выводится только в summary без inline anchor. Неподтверждённые findings
-исключаются; summary показывает их число. Их исключение не блокирует отдельные
-resolutions: прежний thread закрывается только при совпадении fingerprint/path и
-evidence в добавленном коде.
+diff. Для добавленных/изменённых файлов evidence берётся из added/current-side. Для
+удалённых допустимо removed-side evidence только при регрессии от удаления; summary
+явно помечает удалённую сторону и поясняет, что finding описывает возможное
+последствие удаления, а не текущее содержимое. Такие findings не получают inline
+anchor; renderer запрещает публиковать их inline.
+
+Активные прежние findings, чьи comment bodies не содержат secret-like values,
+передаются модели для отдельной оценки; сами комментарии с такими values намеренно
+не отправляются в provider context. Для included findings модель предлагает
+resolution с точным added-side evidence, если issue исправлен, или подтверждённый
+finding, если проблема сохраняется. Клиент независимо проверяет fingerprint/path,
+evidence в индексе и diff. Неподтверждённые findings исключаются и не блокируют
+другие подтверждённые findings или resolutions.
 
 Краткое AI-резюме не проверяется отдельно. У findings сверяются path/evidence с diff;
 смысл замечаний требует ручной оценки.

@@ -31,6 +31,8 @@ pub struct ReviewFinding {
     pub path: String,
     pub line: Option<usize>,
     pub evidence: String,
+    #[serde(skip)]
+    pub removed_file: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash)]
@@ -157,6 +159,9 @@ pub fn has_summary_marker(body: &str) -> bool {
 }
 
 pub fn render_finding_comment(finding: &ReviewFinding) -> Result<String> {
+    if finding.removed_file {
+        bail!("Findings об удалённых файлах публикуются только в PR summary.");
+    }
     let fingerprint = finding_fingerprint(finding);
     let evidence_fence = code_fence(&finding.evidence)?;
     let line = finding
@@ -205,6 +210,11 @@ pub fn render_summary(report: &ReviewReport, head_sha: &str) -> Result<String> {
                 output.push_str(&line.to_string());
             }
             output.push_str("`\n\n");
+            if finding.removed_file {
+                output.push_str(
+                    "**Сторона diff:** удалённый файл; evidence относится к удалённому коду и описывает возможную регрессию от удаления, не текущее содержимое.\n\n",
+                );
+            }
             output.push_str(&markdown_escape(&finding.detail));
             output.push_str("\n\nEvidence:\n");
             let fence = code_fence(&finding.evidence)?;
@@ -303,7 +313,7 @@ fn markdown_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReviewReport, markdown_escape};
+    use super::{ReviewFinding, ReviewReport, markdown_escape};
     use serde_json::json;
 
     #[test]
@@ -327,5 +337,35 @@ mod tests {
         }))
         .expect("report schema deserializes");
         assert!(report.validate().is_err());
+    }
+
+    #[test]
+    fn removed_file_findings_are_labeled_and_summary_only() {
+        let finding = ReviewFinding {
+            category: super::FindingCategory::Bug,
+            title: "Validation removed".to_owned(),
+            detail: "The deletion may bypass validation.".to_owned(),
+            path: "src/deleted.rs".to_owned(),
+            line: None,
+            evidence: "old_validate();".to_owned(),
+            removed_file: true,
+        };
+        assert!(super::render_finding_comment(&finding).is_err());
+
+        let report = ReviewReport {
+            summary: "Review complete.".to_owned(),
+            findings: vec![finding],
+            resolved_findings: Vec::new(),
+        };
+        let head_sha = "a".repeat(40);
+        let summary = super::render_summary(&report, &head_sha)
+            .expect("removed-file finding renders in summary");
+        assert!(
+            summary.contains(
+                "**Сторона diff:** удалённый файл; evidence относится к удалённому коду и описывает возможную регрессию от удаления, не текущее содержимое."
+            )
+        );
+        assert!(summary.contains(r"**Файл:** `src/deleted\.rs`"));
+        assert!(!summary.contains(r"src/deleted\.rs:"));
     }
 }

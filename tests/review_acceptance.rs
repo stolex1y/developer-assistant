@@ -1307,6 +1307,7 @@ fn review_finding() -> ReviewFinding {
         path: "src/transaction.rs".to_owned(),
         line: Some(2),
         evidence: "    calculate_transaction_total();".to_owned(),
+        removed_file: false,
     }
 }
 
@@ -1320,6 +1321,7 @@ fn review_findings() -> Vec<ReviewFinding> {
             path: "src/fees.rs".to_owned(),
             line: Some(1),
             evidence: "pub fn calculate_fee() {".to_owned(),
+            removed_file: false,
         },
         ReviewFinding {
             category: FindingCategory::Recommendation,
@@ -1328,6 +1330,7 @@ fn review_findings() -> Vec<ReviewFinding> {
             path: "src/fees.rs".to_owned(),
             line: Some(3),
             evidence: "    write_fee_audit_log();".to_owned(),
+            removed_file: false,
         },
     ]
 }
