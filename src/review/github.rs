@@ -103,6 +103,12 @@ pub struct ExistingThread {
     pub is_resolved: bool,
     pub is_outdated: bool,
 }
+impl ExistingThread {
+    /// Prior review identity is the permanent marker ID and exact repository path.
+    pub fn matches_finding_identity(&self, fingerprint: &str, path: &str) -> bool {
+        self.fingerprint == fingerprint && self.path == path
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExistingSummary {

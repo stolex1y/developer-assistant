@@ -297,6 +297,38 @@ impl DeepSeekClient {
             }
         }
     }
+    /// One bounded, no-tools pass for uncertain prior findings. It can consume
+    /// only the uncached-input remainder of the original review budget.
+    pub async fn focused_assessment(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        remaining_uncached_input_tokens: u64,
+    ) -> Result<Option<(String, InputTokenUsage)>> {
+        if remaining_uncached_input_tokens == 0 {
+            return Ok(None);
+        }
+        let messages = [
+            ChatMessage::System {
+                content: system_prompt.to_owned(),
+            },
+            ChatMessage::User {
+                content: user_prompt.to_owned(),
+            },
+        ];
+        let completion = self.request(&messages, false).await?;
+        let usage = valid_usage(completion.usage)?;
+        let choice = first_choice(completion.choices)?;
+        if !choice.message.tool_calls.is_empty() {
+            bail!("Focused prior assessment requested tools in no-tools mode.");
+        }
+        let content = choice
+            .message
+            .content
+            .filter(|content| !content.trim().is_empty())
+            .context("Focused prior assessment returned no report.")?;
+        Ok(Some((content, usage)))
+    }
 
     async fn request(
         &self,

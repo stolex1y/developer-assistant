@@ -33,7 +33,7 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
@@ -47,7 +47,7 @@ jobs:
       group: d32-ai-review-${{ inputs.repository }}-${{ inputs.pr_number }}
       cancel-in-progress: true
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
     steps:
       - name: Checkout reviewed PR head

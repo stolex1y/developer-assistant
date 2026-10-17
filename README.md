@@ -199,12 +199,11 @@ tool-enabled запросов; usage финального запроса без 
 сообщают только безопасную категорию serde-ошибки и позицию, без raw provider output.
 
 В целевом GitHub repository задайте Actions secret `DEEPSEEK_API_KEY`.
-`GITHUB_TOKEN` workflow получает автоматически с `contents: read` и
-`pull-requests: write`: первое разрешение нужно для checkout и чтения исходников,
-второе — для PR summary, inline comments и разрешения review threads. Утилита
-сама не выполняет commit, push или merge.
-Workflow запускается при `opened`, `reopened` и `synchronize`; результат — PR summary
-и обновляемые inline threads.
+`GITHUB_TOKEN` получает `contents: write` и `pull-requests: write` для разрешения
+исправленных review threads и публикации PR summary/inline comments. Это
+согласованный security tradeoff: write-доступ ограничен текущим PR workflow;
+утилита не выполняет commit, push или merge. Workflow запускается при `opened`,
+`reopened` и `synchronize`; результат — PR summary и обновляемые inline threads.
 
 В PR summary и inline comments попадают findings с path и evidence, подтверждёнными
 diff. Для добавленных/изменённых файлов evidence берётся из added/current-side. Для
@@ -213,13 +212,22 @@ diff. Для добавленных/изменённых файлов evidence �
 последствие удаления, а не текущее содержимое. Такие findings не получают inline
 anchor; renderer запрещает публиковать их inline.
 
-Активные прежние findings, чьи comment bodies не содержат secret-like values,
-передаются модели для отдельной оценки; сами комментарии с такими values намеренно
-не отправляются в provider context. Для included findings модель предлагает
-resolution с точным added-side evidence, если issue исправлен, или подтверждённый
-finding, если проблема сохраняется. Клиент независимо проверяет fingerprint/path,
-evidence в индексе и diff. Неподтверждённые findings исключаются и не блокируют
-другие подтверждённые findings или resolutions.
+Безопасные прежние активные findings передаются модели вместе с постоянными ID;
+comment bodies с secret-like values в provider context не отправляются. Модель
+оценивает каждое прежнее замечание отдельно: `active` означает, что проблема
+сохраняется (thread остаётся открытым), `resolved` — что она исправлена, а
+`uncertain` — что данных недостаточно (thread тоже остаётся открытым). Ответ
+ссылается на ID и path прежнего finding: title не задаёт идентичность, поэтому
+перефразирование актуального замечания сохраняет его ID, а не создаёт новый
+thread. Новые findings передаются отдельно от оценок прежних.
+
+Клиент строго проверяет report до любых GitHub writes: ID и path должны
+соответствовать переданным прежним findings; неизвестные или повторные решения,
+противоречивые состояния, неверная схема и неподтверждённые данные закрывают
+review без публикации. Закрытие разрешено только для `resolved` и только при
+независимой проверке точного evidence одновременно в added-side diff текущего
+head и текущем индексе. Дубликат сам по себе не доказывает исправление: ранее
+существующие дубли не закрываются автоматически.
 
 Краткое AI-резюме не проверяется отдельно. У findings сверяются path/evidence с diff;
 смысл замечаний требует ручной оценки.

@@ -1,9 +1,16 @@
 use crate::review::corpus::contains_secret_like_value;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::{collections::HashSet, fmt::Write as FmtWrite};
 
+fn required_option<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
 pub const SUMMARY_MARKER: &str = "<!-- developer-assistant:summary:v1 -->";
 const FINDING_MARKER_PREFIX: &str = "<!-- developer-assistant:finding:v1:";
 const MAX_FINDINGS: usize = 32;
@@ -18,8 +25,28 @@ const SUMMARY_DISCLAIMER: &str = "AI-резюме не проверяется о
 #[serde(deny_unknown_fields)]
 pub struct ReviewReport {
     pub summary: String,
-    pub findings: Vec<ReviewFinding>,
-    pub resolved_findings: Vec<ResolvedFinding>,
+    pub new_findings: Vec<ReviewFinding>,
+    pub prior_assessments: Vec<PriorAssessment>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PriorAssessment {
+    pub fingerprint: String,
+    pub path: String,
+    pub status: PriorAssessmentStatus,
+    #[serde(deserialize_with = "required_option")]
+    pub finding: Option<ReviewFinding>,
+    #[serde(deserialize_with = "required_option")]
+    pub resolution_evidence: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorAssessmentStatus {
+    Active,
+    Resolved,
+    Uncertain,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -29,10 +56,13 @@ pub struct ReviewFinding {
     pub title: String,
     pub detail: String,
     pub path: String,
+    #[serde(deserialize_with = "required_option")]
     pub line: Option<usize>,
     pub evidence: String,
     #[serde(skip)]
     pub removed_file: bool,
+    #[serde(skip)]
+    pub marker_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash)]
@@ -41,14 +71,6 @@ pub enum FindingCategory {
     Bug,
     Architecture,
     Recommendation,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ResolvedFinding {
-    pub fingerprint: String,
-    pub path: String,
-    pub evidence: String,
 }
 
 impl ReviewReport {
@@ -72,50 +94,89 @@ impl ReviewReport {
 
     pub fn validate(&self) -> Result<()> {
         validate_text(&self.summary, MAX_SUMMARY_BYTES, "summary")?;
-        if self.findings.len() > MAX_FINDINGS {
-            bail!("DeepSeek вернул больше 32 findings.");
+        if self.new_findings.len() > MAX_FINDINGS {
+            bail!("DeepSeek вернул больше 32 новых findings.");
         }
-
-        let mut fingerprints = HashSet::with_capacity(self.findings.len());
-        for finding in &self.findings {
-            validate_text(&finding.title, 200, "finding title")?;
-            if finding
-                .title
-                .chars()
-                .any(|character| matches!(character, '\n' | '\r' | '\t'))
-            {
-                bail!("Finding title должен занимать одну строку.");
-            }
-            validate_text(&finding.detail, MAX_DETAIL_BYTES, "finding detail")?;
-            validate_text(&finding.path, 1024, "finding path")?;
-            validate_text(&finding.evidence, MAX_EVIDENCE_BYTES, "finding evidence")?;
-            if finding.line == Some(0) {
-                bail!("Finding line должен начинаться с 1.");
-            }
-            let fingerprint = finding_fingerprint(finding);
-            if !fingerprints.insert(fingerprint) {
-                bail!("DeepSeek вернул повторяющийся finding fingerprint.");
+        let mut fingerprints = HashSet::with_capacity(self.new_findings.len());
+        for finding in &self.new_findings {
+            validate_finding(finding)?;
+            if !fingerprints.insert(finding_fingerprint(finding)) {
+                bail!("DeepSeek вернул повторяющийся новый finding fingerprint.");
             }
         }
-
-        if self.resolved_findings.len() > 100 {
-            bail!("DeepSeek вернул слишком много resolved findings.");
+        if self.prior_assessments.len() > 100 {
+            bail!("DeepSeek вернул слишком много prior assessments.");
         }
-        let mut resolved_fingerprints = HashSet::with_capacity(self.resolved_findings.len());
-        for resolved in &self.resolved_findings {
-            validate_fingerprint(&resolved.fingerprint)?;
-            if !resolved_fingerprints.insert(resolved.fingerprint.as_str()) {
-                bail!("DeepSeek вернул повторяющийся resolved fingerprint.");
+        let mut prior_ids = HashSet::with_capacity(self.prior_assessments.len());
+        for assessment in &self.prior_assessments {
+            validate_fingerprint(&assessment.fingerprint)?;
+            if !prior_ids.insert(assessment.fingerprint.as_str()) {
+                bail!("DeepSeek вернул повторяющийся prior assessment ID.");
             }
-            validate_text(&resolved.path, 1024, "resolved finding path")?;
-            validate_text(
-                &resolved.evidence,
-                MAX_EVIDENCE_BYTES,
-                "resolution evidence",
-            )?;
+            validate_text(&assessment.path, 1024, "prior assessment path")?;
+            match assessment.status {
+                PriorAssessmentStatus::Active => {
+                    let finding = assessment
+                        .finding
+                        .as_ref()
+                        .context("Active prior assessment требует обновлённый finding.")?;
+                    if assessment.resolution_evidence.is_some() {
+                        bail!("Active prior assessment не может содержать resolution evidence.");
+                    }
+                    validate_finding(finding)?;
+                    if finding.path != assessment.path {
+                        bail!("Active prior finding path не совпадает с prior assessment path.");
+                    }
+                    if fingerprints.contains(&finding_fingerprint(finding)) {
+                        bail!("New finding duplicates an active prior finding.");
+                    }
+                }
+                PriorAssessmentStatus::Resolved => {
+                    if assessment.finding.is_some() {
+                        bail!("Resolved prior assessment не может содержать active finding.");
+                    }
+                    let evidence = assessment
+                        .resolution_evidence
+                        .as_deref()
+                        .context("Resolved prior assessment требует resolution evidence.")?;
+                    validate_text(evidence, MAX_EVIDENCE_BYTES, "resolution evidence")?;
+                }
+                PriorAssessmentStatus::Uncertain => {
+                    if assessment.finding.is_some() || assessment.resolution_evidence.is_some() {
+                        bail!("Uncertain prior assessment не должен изменять finding.");
+                    }
+                }
+            }
         }
         Ok(())
     }
+}
+impl ReviewReport {
+    pub fn all_findings(&self) -> impl Iterator<Item = &ReviewFinding> {
+        self.new_findings.iter().chain(
+            self.prior_assessments
+                .iter()
+                .filter_map(|assessment| assessment.finding.as_ref()),
+        )
+    }
+}
+
+fn validate_finding(finding: &ReviewFinding) -> Result<()> {
+    validate_text(&finding.title, 200, "finding title")?;
+    if finding
+        .title
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\t'))
+    {
+        bail!("Finding title должен занимать одну строку.");
+    }
+    validate_text(&finding.detail, MAX_DETAIL_BYTES, "finding detail")?;
+    validate_text(&finding.path, 1024, "finding path")?;
+    validate_text(&finding.evidence, MAX_EVIDENCE_BYTES, "finding evidence")?;
+    if finding.line == Some(0) {
+        bail!("Finding line должен начинаться с 1.");
+    }
+    Ok(())
 }
 
 impl FindingCategory {
@@ -137,22 +198,18 @@ impl FindingCategory {
 }
 
 pub fn finding_fingerprint(finding: &ReviewFinding) -> String {
-    let normalized_title = finding
-        .title
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let material = format!(
-        "{}\0{}\0{}",
-        finding.category.as_str(),
-        finding.path,
-        normalized_title.to_lowercase()
-    );
-    let digest = Sha256::digest(material.as_bytes());
-    digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut digest = Sha256::new();
+    digest.update(finding.category.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(finding.path.as_bytes());
+    digest.update([0]);
+    digest.update(finding.evidence.as_bytes());
+    let digest = digest.finalize();
+    let mut fingerprint = String::with_capacity(16);
+    for byte in &digest[..8] {
+        write!(&mut fingerprint, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    fingerprint
 }
 
 pub fn parse_finding_fingerprint(body: &str) -> Option<&str> {
@@ -173,7 +230,10 @@ pub fn render_finding_comment(finding: &ReviewFinding) -> Result<String> {
     if finding.removed_file {
         bail!("Findings об удалённых файлах публикуются только в PR summary.");
     }
-    let fingerprint = finding_fingerprint(finding);
+    let fingerprint = finding
+        .marker_id
+        .clone()
+        .unwrap_or_else(|| finding_fingerprint(finding));
     let evidence_fence = code_fence(&finding.evidence)?;
     let line = finding
         .line
@@ -207,8 +267,7 @@ pub fn render_summary(report: &ReviewReport, head_sha: &str) -> Result<String> {
         output.push('\n');
         let mut found = false;
         for finding in report
-            .findings
-            .iter()
+            .all_findings()
             .filter(|finding| finding.category == category)
         {
             found = true;
@@ -336,7 +395,7 @@ mod tests {
     fn finding_title_is_single_line() {
         let report: ReviewReport = serde_json::from_value(json!({
             "summary":"Review complete.",
-            "findings":[{
+            "new_findings":[{
                 "category":"bug",
                 "title":"Injected title\n@reviewer",
                 "detail":"A synthetic detail.",
@@ -344,9 +403,56 @@ mod tests {
                 "line":1,
                 "evidence":"safe evidence"
             }],
-            "resolved_findings":[]
+            "prior_assessments":[]
         }))
         .expect("report schema deserializes");
+        assert!(report.validate().is_err());
+    }
+    #[test]
+    fn finding_identity_ignores_paraphrased_title_and_prior_marker_is_preserved() {
+        let finding = ReviewFinding {
+            category: super::FindingCategory::Bug,
+            title: "Balance is checked too late".to_owned(),
+            detail: "The invariant is checked after total calculation.".to_owned(),
+            path: "src/transaction.rs".to_owned(),
+            line: Some(2),
+            evidence: "calculate_transaction_total();".to_owned(),
+            removed_file: false,
+            marker_id: None,
+        };
+        let mut paraphrase = finding.clone();
+        paraphrase.title = "Total calculation precedes balance validation".to_owned();
+        assert_eq!(
+            super::finding_fingerprint(&finding),
+            super::finding_fingerprint(&paraphrase)
+        );
+        paraphrase.marker_id = Some("0123456789abcdef".to_owned());
+        let comment = super::render_finding_comment(&paraphrase).unwrap();
+        assert!(comment.starts_with("<!-- developer-assistant:finding:v1:0123456789abcdef -->"));
+    }
+    #[test]
+    fn duplicate_prior_assessment_ids_are_rejected() {
+        let report: ReviewReport = serde_json::from_value(json!({
+            "summary":"Review complete.",
+            "new_findings":[],
+            "prior_assessments":[
+                {
+                    "fingerprint":"0123456789abcdef",
+                    "path":"src/transaction.rs",
+                    "status":"uncertain",
+                    "finding":null,
+                    "resolution_evidence":null
+                },
+                {
+                    "fingerprint":"0123456789abcdef",
+                    "path":"src/transaction.rs",
+                    "status":"uncertain",
+                    "finding":null,
+                    "resolution_evidence":null
+                }
+            ]
+        }))
+        .expect("schema deserializes before semantic validation");
         assert!(report.validate().is_err());
     }
 
@@ -360,13 +466,14 @@ mod tests {
             line: None,
             evidence: "old_validate();".to_owned(),
             removed_file: true,
+            marker_id: None,
         };
         assert!(super::render_finding_comment(&finding).is_err());
 
         let report = ReviewReport {
             summary: "Review complete.".to_owned(),
-            findings: vec![finding],
-            resolved_findings: Vec::new(),
+            new_findings: vec![finding],
+            prior_assessments: Vec::new(),
         };
         let head_sha = "a".repeat(40);
         let summary = super::render_summary(&report, &head_sha)

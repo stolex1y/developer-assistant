@@ -384,7 +384,7 @@ async fn d32_review_token_budget_denies_pending_tool_and_logs_final_usage_separa
             "stop",
             json!({
                 "role": "assistant",
-                "content": "{\"summary\":\"Review is bounded.\",\"findings\":[],\"resolved_findings\":[]}"
+                "content": "{\"summary\":\"Review is bounded.\",\"new_findings\":[],\"prior_assessments\":[]}"
             }),
             100,
             80,
@@ -629,19 +629,25 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
             &findings,
             Vec::new(),
         )),
-        deepseek_review_response(review_report_many(
-            "Повторная проверка подтверждает те же категории и места.",
-            &findings,
-            Vec::new(),
+        deepseek_review_response(review_report_with_assessments(
+            "Повторная проверка подтверждает актуальные замечания.",
+            vec![finding_json(&findings[0])],
+            findings.iter().skip(1).map(prior_active).collect(),
         )),
-        deepseek_review_response(review_report_many(
-            "The unverified finding must not leak into the published summary.",
-            &[unsupported_finding],
-            vec![json!({
-                "fingerprint": fingerprint,
-                "path": "src/transaction.rs",
-                "evidence": "    if !validate_transaction_balance() {"
-            })],
+        deepseek_review_response(review_report_with_assessments(
+            "Проверка diff завершена.",
+            vec![finding_json(&unsupported_finding)],
+            vec![
+                json!({
+                    "fingerprint": fingerprint,
+                    "path": "src/transaction.rs",
+                    "status": "resolved",
+                    "finding": null,
+                    "resolution_evidence": "    if !validate_transaction_balance() {"
+                }),
+                prior_active(&findings[1]),
+                prior_active(&findings[2]),
+            ],
         )),
     ];
     let (deepseek_url, deepseek_server) = scripted_http(responses).await;
@@ -715,8 +721,8 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
         .run_with_index(root, &identity_two, 10_000, &mut index)
         .await
         .expect("resolution with current changed-code evidence succeeds");
-    assert_eq!(third.findings_published, 0);
-    assert_eq!(third.threads_resolved, 2);
+    assert_eq!(third.findings_published, 2);
+    assert_eq!(third.threads_resolved, 1);
 
     let deepseek_requests = deepseek_server
         .await
@@ -797,7 +803,7 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
         2,
         "unchanged architecture and recommendation findings stay open"
     );
-    assert_eq!(github_state.threads.len(), 4);
+    assert_eq!(github_state.threads.len(), 3);
     assert_eq!(github_state.summaries.len(), 1);
     let updated_summary = &github_state.summaries[0].body;
     assert!(updated_summary.contains("Неподтверждённые findings не опубликованы"));
@@ -843,8 +849,8 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
             .filter(|request| request.method == "POST"
                 && request.path == "/api/repos/acme/transaction-import/pulls/7/comments")
             .count(),
-        4,
-        "a new current anchor replaces only the outdated inline thread"
+        3,
+        "the existing outdated inline thread is reused instead of creating a replacement"
     );
     assert_eq!(
         github_state
@@ -855,7 +861,7 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
                     .path
                     .starts_with("/api/repos/acme/transaction-import/pulls/comments/"))
             .count(),
-        2
+        5
     );
     assert_eq!(
         github_state
@@ -866,7 +872,7 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
                     .as_str()
                     .is_some_and(|query| query.contains("resolveReviewThread")))
             .count(),
-        2
+        1
     );
     assert!(
         github_state
@@ -880,6 +886,413 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
             |request| request.authorization.as_deref() == Some("Bearer synthetic-github-token")
         )
     );
+}
+
+#[tokio::test]
+async fn d32_review_active_identity_updates_outdated_thread_and_publishes_only_new_evidence() {
+    let fixture = review_project_fixture();
+    let root = fixture.path();
+    let base_sha = "b".repeat(40);
+    let head_sha = git_head(root);
+    let patch = "@@ -0,0 +1,3 @@\n+pub fn calculate() {\n+    calculate_transaction_total();\n+}\n";
+    let (github_url, github_server, control) =
+        mock_github_server(base_sha.clone(), head_sha.clone(), patch.to_owned(), None).await;
+    let original = review_finding();
+    let mut changed_title = original.clone();
+    changed_title.title = "Validate balance before calculating the total".to_owned();
+    let new_finding = ReviewFinding {
+        category: FindingCategory::Bug,
+        title: "Calculation is not guarded".to_owned(),
+        detail: "The calculation can run without the required validation.".to_owned(),
+        path: "src/transaction.rs".to_owned(),
+        line: Some(1),
+        evidence: "pub fn calculate() {".to_owned(),
+        removed_file: false,
+        marker_id: None,
+    };
+    let (deepseek_url, deepseek_server) = scripted_http(vec![
+        deepseek_review_response(review_report(
+            "Initial finding.",
+            Some(&original),
+            Vec::new(),
+        )),
+        deepseek_review_response(review_report_with_assessments(
+            "The prior finding remains active, with one new evidence-backed finding.",
+            vec![finding_json(&new_finding)],
+            vec![prior_active(&changed_title)],
+        )),
+    ])
+    .await;
+    let runner = ReviewRunner::new(
+        GitHubClient::new(github_url, "synthetic-github-token".to_owned()).unwrap(),
+        DeepSeekClient::new(
+            deepseek_url,
+            "synthetic-deepseek-key".to_owned(),
+            "deepseek-flash".to_owned(),
+        )
+        .unwrap(),
+    );
+    let identity = PullRequestId {
+        owner: "acme".to_owned(),
+        repository: "transaction-import".to_owned(),
+        number: 7,
+        expected_base_sha: base_sha,
+        expected_head_sha: head_sha,
+    };
+    let mut index = ReviewIndex::open(
+        root,
+        &root.join(".data/review-active-identity/index"),
+        FixtureEmbedder::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        runner
+            .run_with_index(root, &identity, 10_000, &mut index)
+            .await
+            .unwrap()
+            .threads_created_or_updated,
+        1
+    );
+    let original_fingerprint = finding_fingerprint(&original);
+    update_mock_thread(
+        &control,
+        500,
+        format!("<!-- developer-assistant:finding:v1:{original_fingerprint} -->\nOutdated body"),
+        true,
+    )
+    .await;
+    let second = runner
+        .run_with_index(root, &identity, 10_000, &mut index)
+        .await
+        .expect("active identity and genuinely new evidence are accepted");
+    assert_eq!(second.findings_published, 2);
+    assert_eq!(second.threads_created_or_updated, 2);
+    let requests = deepseek_server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let prior = request_user_json(&requests[1])["active_prior_findings"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(prior.len(), 1);
+    assert_eq!(prior[0]["fingerprint"], original_fingerprint);
+    control.send(MockGithubControl::Shutdown).unwrap();
+    let state = github_server.await.unwrap();
+    let inline_posts = state
+        .requests
+        .iter()
+        .filter(|request| {
+            request.method == "POST"
+                && request.path == "/api/repos/acme/transaction-import/pulls/7/comments"
+        })
+        .count();
+    assert_eq!(
+        inline_posts, 2,
+        "only initial and genuinely new finding POST"
+    );
+    assert!(
+        state.requests.iter().any(|request| {
+            request.method == "PATCH"
+                && request.path == "/api/repos/acme/transaction-import/pulls/comments/500"
+        }),
+        "the outdated existing marker is updated in place"
+    );
+    assert_eq!(
+        state.threads.len(),
+        2,
+        "outdated match does not create a duplicate thread"
+    );
+    assert!(
+        state.threads.iter().any(|thread| {
+            thread.comment_id == 500
+                && !thread.is_resolved
+                && thread.body.contains(&changed_title.title)
+        }),
+        "the original marker/thread remains active with its refreshed title"
+    );
+    assert!(
+        state.threads.iter().any(|thread| {
+            thread.body.contains(&new_finding.title) && thread.body.contains(&new_finding.evidence)
+        }),
+        "new thread has distinct, current diff evidence"
+    );
+}
+
+#[tokio::test]
+async fn d32_review_invalid_prior_identity_profiles_make_no_github_mutations() {
+    let profiles = [
+        "unknown prior ID",
+        "missing assessment",
+        "duplicate assessment ID",
+        "mismatched assessment path",
+        "resolved assessment with active finding",
+        "active assessment with resolution evidence",
+        "new finding duplicates active identity",
+    ];
+    for profile in profiles {
+        let fixture = review_project_fixture();
+        let root = fixture.path();
+        let base_sha = "b".repeat(40);
+        let head_sha = git_head(root);
+        let patch =
+            "@@ -0,0 +1,3 @@\n+pub fn calculate() {\n+    calculate_transaction_total();\n+}\n";
+        let (github_url, github_server, control) =
+            mock_github_server(base_sha.clone(), head_sha.clone(), patch.to_owned(), None).await;
+        let finding = review_finding();
+        let mut duplicate_new = finding.clone();
+        duplicate_new.title = "Changed title, same permanent identity".to_owned();
+        let mut assessment = prior_active(&finding);
+        match profile {
+            "unknown prior ID" => assessment["fingerprint"] = json!("0000000000000000"),
+            "mismatched assessment path" => assessment["path"] = json!("src/other.rs"),
+            "resolved assessment with active finding" => {
+                assessment["status"] = json!("resolved");
+                assessment["resolution_evidence"] = json!("    calculate_transaction_total();");
+            }
+            "active assessment with resolution evidence" => {
+                assessment["resolution_evidence"] = json!("    calculate_transaction_total();");
+            }
+            _ => {}
+        }
+        let second_assessments = match profile {
+            "missing assessment" => Vec::new(),
+            "duplicate assessment ID" => vec![assessment.clone(), assessment.clone()],
+            _ => vec![assessment],
+        };
+        let second_findings = if profile == "new finding duplicates active identity" {
+            vec![finding_json(&duplicate_new)]
+        } else {
+            Vec::new()
+        };
+        let (deepseek_url, deepseek_server) = scripted_http(vec![
+            deepseek_review_response(review_report(
+                "Initial finding.",
+                Some(&finding),
+                Vec::new(),
+            )),
+            deepseek_review_response(review_report_with_assessments(
+                "Invalid assessment profile.",
+                second_findings,
+                second_assessments,
+            )),
+        ])
+        .await;
+        let runner = ReviewRunner::new(
+            GitHubClient::new(github_url, "synthetic-github-token".to_owned()).unwrap(),
+            DeepSeekClient::new(
+                deepseek_url,
+                "synthetic-deepseek-key".to_owned(),
+                "deepseek-flash".to_owned(),
+            )
+            .unwrap(),
+        );
+        let identity = PullRequestId {
+            owner: "acme".to_owned(),
+            repository: "transaction-import".to_owned(),
+            number: 7,
+            expected_base_sha: base_sha,
+            expected_head_sha: head_sha,
+        };
+        let mut index = ReviewIndex::open(
+            root,
+            &root.join(".data/review-invalid-identity/index"),
+            FixtureEmbedder::default(),
+        )
+        .unwrap();
+        runner
+            .run_with_index(root, &identity, 10_000, &mut index)
+            .await
+            .unwrap_or_else(|error| panic!("initial finding publishes for {profile}: {error}"));
+        let error = runner
+            .run_with_index(root, &identity, 10_000, &mut index)
+            .await
+            .expect_err(&format!("{profile} must reject the second report"));
+        assert!(
+            error.to_string().contains("prior")
+                || error.to_string().contains("report contract")
+                || error.to_string().contains("assessment"),
+            "{profile} should produce a report/identity error, got: {error}"
+        );
+        assert_eq!(deepseek_server.await.unwrap().len(), 2);
+        control.send(MockGithubControl::Shutdown).unwrap();
+        let state = github_server.await.unwrap();
+        let mutations = state
+            .requests
+            .iter()
+            .filter(|request| {
+                request.method == "PATCH"
+                    || (request.method == "POST"
+                        && (request.path.ends_with("/pulls/7/comments")
+                            || request.path.ends_with("/issues/7/comments")
+                            || request.body["query"]
+                                .as_str()
+                                .is_some_and(|query| query.contains("resolveReviewThread"))))
+            })
+            .count();
+        assert_eq!(
+            mutations, 2,
+            "{profile}: no GitHub writes beyond first-run inline and summary posts"
+        );
+    }
+}
+
+#[tokio::test]
+async fn d32_focused_uncertain_assessment_uses_remaining_budget_and_preserves_usage() {
+    let fixture = review_project_fixture();
+    let root = fixture.path();
+    let base_sha = "b".repeat(40);
+    let head_sha = git_head(root);
+    let patch = "@@ -0,0 +1,3 @@\n+pub fn calculate() {\n+    calculate_transaction_total();\n+}\n";
+    let (github_url, github_server, control) =
+        mock_github_server(base_sha.clone(), head_sha.clone(), patch.to_owned(), None).await;
+    let finding = review_finding();
+    let initial = deepseek_review_response(review_report(
+        "Initial finding.",
+        Some(&finding),
+        Vec::new(),
+    ));
+    let primary_uncertain = deepseek_response(
+        "stop",
+        json!({
+            "role":"assistant",
+            "content":serde_json::to_string(&review_report(
+                "The prior finding remains uncertain.",
+                None,
+                vec![prior_uncertain(&finding)]
+            )).unwrap()
+        }),
+        500,
+        300,
+        200,
+    );
+    let focused_uncertain = deepseek_response(
+        "stop",
+        json!({
+            "role":"assistant",
+            "content":serde_json::to_string(&review_report(
+                "Focused evidence remains uncertain.",
+                None,
+                vec![prior_uncertain(&finding)]
+            )).unwrap()
+        }),
+        200,
+        150,
+        50,
+    );
+    let (deepseek_url, deepseek_server) =
+        scripted_http(vec![initial, primary_uncertain, focused_uncertain]).await;
+    let runner = ReviewRunner::new(
+        GitHubClient::new(github_url, "synthetic-github-token".to_owned()).unwrap(),
+        DeepSeekClient::new(
+            deepseek_url,
+            "synthetic-deepseek-key".to_owned(),
+            "deepseek-flash".to_owned(),
+        )
+        .unwrap(),
+    );
+    let identity = PullRequestId {
+        owner: "acme".to_owned(),
+        repository: "transaction-import".to_owned(),
+        number: 7,
+        expected_base_sha: base_sha,
+        expected_head_sha: head_sha,
+    };
+    let mut index = ReviewIndex::open(
+        root,
+        &root.join(".data/review-focused-uncertain/index"),
+        FixtureEmbedder::default(),
+    )
+    .unwrap();
+    runner
+        .run_with_index(root, &identity, 10_000, &mut index)
+        .await
+        .expect("initial finding publishes");
+    let second = runner
+        .run_with_index(root, &identity, 1_000, &mut index)
+        .await
+        .expect("focused uncertain assessment remains non-mutating");
+    assert_eq!(second.retrieval_uncached_input_tokens, 250);
+    assert_eq!(
+        second.final_usage, None,
+        "focused usage is budgeted; no separate budget-exhaustion final request occurred"
+    );
+    assert_eq!(second.requests, 2);
+    let requests = deepseek_server.await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].body["tool_choice"], "none");
+    assert!(requests[2].body.get("tools").is_none());
+    control.send(MockGithubControl::Shutdown).unwrap();
+    let state = github_server.await.unwrap();
+    assert_eq!(state.threads.len(), 1);
+    assert!(
+        !state.threads[0].is_resolved,
+        "uncertain finding stays open"
+    );
+
+    let fixture = review_project_fixture();
+    let root = fixture.path();
+    let base_sha = "b".repeat(40);
+    let head_sha = git_head(root);
+    let (github_url, github_server, control) =
+        mock_github_server(base_sha.clone(), head_sha.clone(), patch.to_owned(), None).await;
+    let (deepseek_url, deepseek_server) = scripted_http(vec![
+        deepseek_review_response(review_report(
+            "Initial finding.",
+            Some(&finding),
+            Vec::new(),
+        )),
+        deepseek_response(
+            "stop",
+            json!({
+                "role":"assistant",
+                "content":serde_json::to_string(&review_report(
+                    "Prior finding uncertain.",
+                    None,
+                    vec![prior_uncertain(&finding)]
+                )).unwrap()
+            }),
+            1_000,
+            0,
+            1_000,
+        ),
+    ])
+    .await;
+    let runner = ReviewRunner::new(
+        GitHubClient::new(github_url, "synthetic-github-token".to_owned()).unwrap(),
+        DeepSeekClient::new(
+            deepseek_url,
+            "synthetic-deepseek-key".to_owned(),
+            "deepseek-flash".to_owned(),
+        )
+        .unwrap(),
+    );
+    let identity = PullRequestId {
+        owner: "acme".to_owned(),
+        repository: "transaction-import".to_owned(),
+        number: 7,
+        expected_base_sha: base_sha,
+        expected_head_sha: head_sha,
+    };
+    let mut index = ReviewIndex::open(
+        root,
+        &root.join(".data/review-focused-zero/index"),
+        FixtureEmbedder::default(),
+    )
+    .unwrap();
+    runner
+        .run_with_index(root, &identity, 10_000, &mut index)
+        .await
+        .unwrap();
+    let skipped = runner
+        .run_with_index(root, &identity, 1_000, &mut index)
+        .await
+        .expect("zero remaining focused budget skips focused request");
+    assert_eq!(skipped.retrieval_uncached_input_tokens, 1_000);
+    assert_eq!(skipped.requests, 1);
+    assert_eq!(deepseek_server.await.unwrap().len(), 2);
+    control.send(MockGithubControl::Shutdown).unwrap();
+    let state = github_server.await.unwrap();
+    assert_eq!(state.threads.len(), 1);
+    assert!(!state.threads[0].is_resolved);
 }
 
 #[tokio::test]
@@ -974,7 +1387,6 @@ async fn d32_review_resolution_requires_new_code_not_unchanged_context() {
     .await;
     let mut finding = review_finding();
     finding.line = Some(5);
-    let fingerprint = finding_fingerprint(&finding);
     let responses = vec![
         deepseek_review_response(review_report(
             "Проверить порядок расчета и balance guard.",
@@ -984,11 +1396,12 @@ async fn d32_review_resolution_requires_new_code_not_unchanged_context() {
         deepseek_review_response(review_report(
             "Изменена только поясняющая строка.",
             None,
-            vec![json!({
-                "fingerprint": fingerprint,
-                "path": "src/transaction.rs",
-                "evidence": "    if !validate_transaction_balance() {"
-            })],
+            vec![prior_uncertain(&finding)],
+        )),
+        deepseek_review_response(review_report(
+            "Новый комментарий не подтверждает устранение.",
+            None,
+            vec![prior_uncertain(&finding)],
         )),
     ];
     let (deepseek_url, deepseek_server) = scripted_http(responses).await;
@@ -1045,9 +1458,14 @@ async fn d32_review_resolution_requires_new_code_not_unchanged_context() {
         .expect("context-only resolution suggestion is safely ignored");
     assert_eq!(second.threads_resolved, 0);
 
-    let _ = deepseek_server
+    let requests = deepseek_server
         .await
-        .expect("DeepSeek fake answered both review requests");
+        .expect("DeepSeek fake answered primary and focused assessments");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(second.requests, 2);
+    assert_eq!(second.retrieval_uncached_input_tokens, 600);
+    assert_eq!(requests[2].body["tool_choice"], "none");
+    assert!(requests[2].body.get("tools").is_none());
     control.send(MockGithubControl::Shutdown).unwrap();
     let github_state = github_server.await.unwrap();
     assert_eq!(github_state.threads.len(), 1);
@@ -1301,7 +1719,7 @@ async fn d32_review_malformed_report_fails_before_github_writes() {
         "stop",
         json!({
             "role": "assistant",
-            "content": format!(r#"{{"summary":"{marker}","findings":[]}}"#)
+            "content": format!(r#"{{"summary":"{marker}","new_findings":[]}}"#)
         }),
         1_000,
         700,
@@ -1374,7 +1792,7 @@ async fn d32_review_missing_usage_fails_closed_before_returning_model_content() 
             "finish_reason": "stop",
             "message": {
                 "role": "assistant",
-                "content": "{\"summary\":\"untrusted\",\"findings\":[],\"resolved_findings\":[]}"
+                "content": "{\"summary\":\"untrusted\",\"new_findings\":[],\"prior_assessments\":[]}"
             }
         }]
     })];
@@ -1463,6 +1881,7 @@ fn review_finding() -> ReviewFinding {
         line: Some(2),
         evidence: "    calculate_transaction_total();".to_owned(),
         removed_file: false,
+        marker_id: None,
     }
 }
 
@@ -1477,6 +1896,7 @@ fn review_findings() -> Vec<ReviewFinding> {
             line: Some(1),
             evidence: "pub fn calculate_fee() {".to_owned(),
             removed_file: false,
+            marker_id: None,
         },
         ReviewFinding {
             category: FindingCategory::Recommendation,
@@ -1486,33 +1906,75 @@ fn review_findings() -> Vec<ReviewFinding> {
             line: Some(3),
             evidence: "    write_fee_audit_log();".to_owned(),
             removed_file: false,
+            marker_id: None,
         },
     ]
 }
 
-fn review_report(summary: &str, finding: Option<&ReviewFinding>, resolved: Vec<Value>) -> Value {
+fn review_report(summary: &str, finding: Option<&ReviewFinding>, assessments: Vec<Value>) -> Value {
     let findings = finding.into_iter().cloned().collect::<Vec<_>>();
-    review_report_many(summary, &findings, resolved)
+    review_report_many(summary, &findings, assessments)
+}
+fn review_report_many(summary: &str, findings: &[ReviewFinding], assessments: Vec<Value>) -> Value {
+    let findings = findings.iter().map(finding_json).collect::<Vec<_>>();
+    review_report_with_assessments(summary, findings, assessments)
 }
 
-fn review_report_many(summary: &str, findings: &[ReviewFinding], resolved: Vec<Value>) -> Value {
-    let findings = findings
-        .iter()
-        .map(|finding| {
-            json!({
-                "category": finding.category.as_str(),
-                "title": finding.title,
-                "detail": finding.detail,
-                "path": finding.path,
-                "line": finding.line,
-                "evidence": finding.evidence
-            })
+fn review_report_with_assessments(
+    summary: &str,
+    new_findings: Vec<Value>,
+    assessments: Vec<Value>,
+) -> Value {
+    let assessments = assessments
+        .into_iter()
+        .map(|assessment| {
+            if assessment.get("status").is_some() {
+                assessment
+            } else {
+                json!({
+                    "fingerprint": assessment["fingerprint"],
+                    "path": assessment["path"],
+                    "status": "resolved",
+                    "finding": null,
+                    "resolution_evidence": assessment["evidence"]
+                })
+            }
         })
         .collect::<Vec<_>>();
     json!({
         "summary": summary,
-        "findings": findings,
-        "resolved_findings": resolved
+        "new_findings": new_findings,
+        "prior_assessments": assessments
+    })
+}
+
+fn finding_json(finding: &ReviewFinding) -> Value {
+    json!({
+        "category": finding.category.as_str(),
+        "title": finding.title,
+        "detail": finding.detail,
+        "path": finding.path,
+        "line": finding.line,
+        "evidence": finding.evidence
+    })
+}
+
+fn prior_active(finding: &ReviewFinding) -> Value {
+    json!({
+        "fingerprint": finding_fingerprint(finding),
+        "path": finding.path,
+        "status": "active",
+        "finding": finding_json(finding),
+        "resolution_evidence": null
+    })
+}
+fn prior_uncertain(finding: &ReviewFinding) -> Value {
+    json!({
+        "fingerprint": finding_fingerprint(finding),
+        "path": finding.path,
+        "status": "uncertain",
+        "finding": null,
+        "resolution_evidence": null
     })
 }
 

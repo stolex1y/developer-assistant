@@ -161,7 +161,7 @@ async fn run_review(
         result.threads_resolved
     );
     println!(
-        "Tool-enabled uncached input tokens: {}; tool calls: {}; provider requests: {}.",
+        "Budgeted uncached input tokens (retrieval + focused assessment): {}; tool calls: {}; provider requests: {}.",
         result.retrieval_uncached_input_tokens, result.tool_calls_executed, result.requests
     );
     if let Some(usage) = result.final_usage {
