@@ -69,6 +69,12 @@ pub struct ToolLoopResult {
 
 pub use crate::provider::InputTokenUsage;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FocusedResolutionResult {
+    pub content: String,
+    pub usage: InputTokenUsage,
+}
+
 #[derive(Serialize)]
 struct ChatCompletionRequest<'a> {
     model: &'a str,
@@ -297,6 +303,33 @@ impl DeepSeekClient {
                 });
             }
         }
+    }
+
+    pub async fn focused_resolution(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<FocusedResolutionResult> {
+        let messages = vec![
+            ChatMessage::System {
+                content: system_prompt.to_owned(),
+            },
+            ChatMessage::User {
+                content: user_prompt.to_owned(),
+            },
+        ];
+        let completion = self.request(&messages, false).await?;
+        let usage = valid_usage(completion.usage)?;
+        let choice = first_choice(completion.choices)?;
+        if !choice.message.tool_calls.is_empty() {
+            bail!("DeepSeek вернул tool call в focused resolution request без tools.");
+        }
+        let content = choice
+            .message
+            .content
+            .filter(|content| !content.trim().is_empty())
+            .context("DeepSeek не вернул focused resolution.")?;
+        Ok(FocusedResolutionResult { content, usage })
     }
 
     async fn request(

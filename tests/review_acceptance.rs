@@ -643,6 +643,16 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
                 "evidence": "    if !validate_transaction_balance() {"
             })],
         )),
+        deepseek_response(
+            "stop",
+            json!({
+                "role": "assistant",
+                "content": "{\"resolved_findings\":[]}"
+            }),
+            200,
+            100,
+            100,
+        ),
     ];
     let (deepseek_url, deepseek_server) = scripted_http(responses).await;
     let github = GitHubClient::new(github_url, "synthetic-github-token".to_owned())
@@ -717,11 +727,11 @@ async fn d32_review_pipeline_is_idempotent_and_resolves_only_with_changed_head_e
         .expect("resolution with current changed-code evidence succeeds");
     assert_eq!(third.findings_published, 0);
     assert_eq!(third.threads_resolved, 2);
-
+    assert_eq!(third.requests, 2);
     let deepseek_requests = deepseek_server
         .await
         .expect("scripted DeepSeek server handled all requests");
-    assert_eq!(deepseek_requests.len(), 4);
+    assert_eq!(deepseek_requests.len(), 5);
     let first_user_prompt = request_user_json(&deepseek_requests[0]);
     assert_eq!(
         first_user_prompt["changed_files"],
@@ -990,6 +1000,16 @@ async fn d32_review_resolution_requires_new_code_not_unchanged_context() {
                 "evidence": "    if !validate_transaction_balance() {"
             })],
         )),
+        deepseek_response(
+            "stop",
+            json!({
+                "role": "assistant",
+                "content": "{\"resolved_findings\":[]}"
+            }),
+            1_000,
+            800,
+            200,
+        ),
     ];
     let (deepseek_url, deepseek_server) = scripted_http(responses).await;
     let runner = ReviewRunner::new(
@@ -1044,10 +1064,291 @@ async fn d32_review_resolution_requires_new_code_not_unchanged_context() {
         .await
         .expect("context-only resolution suggestion is safely ignored");
     assert_eq!(second.threads_resolved, 0);
+    assert_eq!(second.requests, 2);
+    assert_eq!(second.budgeted_uncached_input_tokens, 500);
+    assert_eq!(
+        second.focused_resolution_usage,
+        Some(InputTokenUsage {
+            prompt_tokens: 1_000,
+            cached_input_tokens: 800,
+            uncached_input_tokens: 200,
+        })
+    );
 
-    let _ = deepseek_server
+    let deepseek_requests = deepseek_server
         .await
-        .expect("DeepSeek fake answered both review requests");
+        .expect("DeepSeek fake answered all three provider requests");
+    assert_eq!(deepseek_requests.len(), 3);
+    assert_eq!(deepseek_requests[2].body["tool_choice"], "none");
+    assert!(deepseek_requests[2].body.get("tools").is_none());
+    assert_eq!(
+        request_user_json(&deepseek_requests[2])["active_prior_findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    control.send(MockGithubControl::Shutdown).unwrap();
+    let github_state = github_server.await.unwrap();
+    assert_eq!(github_state.threads.len(), 1);
+    assert!(!github_state.threads[0].is_resolved);
+    assert!(github_state.requests.iter().all(|request| {
+        !request.body["query"]
+            .as_str()
+            .is_some_and(|query| query.contains("resolveReviewThread"))
+    }));
+}
+
+#[tokio::test]
+async fn d32_focused_resolution_pass_obeys_uncached_budget() {
+    let fixture = review_project_fixture();
+    let root = fixture.path();
+    let base_sha = "b".repeat(40);
+    let head_one = git_head(root);
+    let patch_one =
+        "@@ -0,0 +1,3 @@\n+pub fn calculate() {\n+    calculate_transaction_total();\n+}\n";
+    let (github_url, github_server, control) = mock_github_server(
+        base_sha.clone(),
+        head_one.clone(),
+        patch_one.to_owned(),
+        None,
+    )
+    .await;
+    let finding = review_finding();
+    let fingerprint = finding_fingerprint(&finding);
+    let initial_report = review_report(
+        "The balance is not checked before calculating the total.",
+        Some(&finding),
+        Vec::new(),
+    );
+    let main_update = review_report("The changed code contains no finding.", None, Vec::new());
+    let focused_update = json!({
+        "resolved_findings": [
+            {
+                "fingerprint": "not-a-valid-fingerprint",
+                "path": "src/transaction.rs",
+                "evidence": "unsupported candidate"
+            },
+            {
+                "fingerprint": fingerprint,
+                "path": "src/transaction.rs",
+                "evidence": "    if !validate_transaction_balance() {"
+            }
+        ]
+    });
+    let responses = vec![
+        deepseek_review_response(initial_report),
+        deepseek_response(
+            "stop",
+            json!({
+                "role": "assistant",
+                "content": serde_json::to_string(&main_update).unwrap()
+            }),
+            50,
+            10,
+            40,
+        ),
+        deepseek_response(
+            "stop",
+            json!({
+                "role": "assistant",
+                "content": serde_json::to_string(&focused_update).unwrap()
+            }),
+            100,
+            75,
+            25,
+        ),
+    ];
+    let (deepseek_url, deepseek_server) = scripted_http(responses).await;
+    let runner = ReviewRunner::new(
+        GitHubClient::new(github_url, "synthetic-github-token".to_owned()).unwrap(),
+        DeepSeekClient::new(
+            deepseek_url,
+            "synthetic-deepseek-key".to_owned(),
+            "deepseek-flash".to_owned(),
+        )
+        .unwrap(),
+    );
+    let identity_one = PullRequestId {
+        owner: "acme".to_owned(),
+        repository: "transaction-import".to_owned(),
+        number: 7,
+        expected_base_sha: base_sha,
+        expected_head_sha: head_one,
+    };
+    let cache = root.join(".data/focused-resolution/index");
+    let mut index = ReviewIndex::open(root, &cache, FixtureEmbedder::default())
+        .expect("initial synthetic corpus indexes");
+    let first = runner
+        .run_with_index(root, &identity_one, 1_000, &mut index)
+        .await
+        .expect("initial review publishes the finding");
+    assert_eq!(first.threads_created_or_updated, 1);
+    assert_eq!(first.focused_resolution_usage, None);
+
+    write_text(
+        root,
+        "src/transaction.rs",
+        "pub fn calculate() {\n    if !validate_transaction_balance() {\n        return;\n    }\n    calculate_transaction_total();\n}\n",
+    );
+    let head_two = commit_fixture(root, "add balance guard");
+    let patch_two = "@@ -1,3 +1,6 @@\n pub fn calculate() {\n+    if !validate_transaction_balance() {\n+        return;\n+    }\n     calculate_transaction_total();\n }\n";
+    set_mock_snapshot(&control, head_two.clone(), patch_two.to_owned()).await;
+    drop(index);
+    let mut index = ReviewIndex::open(root, &cache, FixtureEmbedder::default())
+        .expect("updated synthetic corpus reindexes");
+    let identity_two = PullRequestId {
+        expected_head_sha: head_two,
+        ..identity_one
+    };
+    let second = runner
+        .run_with_index(root, &identity_two, 1_000, &mut index)
+        .await
+        .expect("focused pass resolves the prior finding with added-side evidence");
+    assert_eq!(second.threads_resolved, 1);
+    assert_eq!(second.retrieval_uncached_input_tokens, 40);
+    assert_eq!(second.budgeted_uncached_input_tokens, 65);
+    assert_eq!(second.requests, 2);
+    assert_eq!(
+        second.focused_resolution_usage,
+        Some(InputTokenUsage {
+            prompt_tokens: 100,
+            cached_input_tokens: 75,
+            uncached_input_tokens: 25,
+        })
+    );
+
+    let deepseek_requests = deepseek_server
+        .await
+        .expect("fake DeepSeek handled initial, main and focused requests");
+    assert_eq!(deepseek_requests.len(), 3);
+    let focused_request = &deepseek_requests[2];
+    assert_eq!(focused_request.body["tool_choice"], "none");
+    assert!(focused_request.body.get("tools").is_none());
+    assert_eq!(
+        focused_request.body["response_format"]["type"],
+        "json_object"
+    );
+    let focused_context = request_user_json(focused_request);
+    assert_eq!(
+        focused_context["active_prior_findings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        focused_context["changed_added_side"][0]["added_side"]
+            .as_str()
+            .unwrap()
+            .contains("    if !validate_transaction_balance() {")
+    );
+    assert!(
+        !focused_context["changed_added_side"][0]["added_side"]
+            .as_str()
+            .unwrap()
+            .contains("calculate_transaction_total();")
+    );
+
+    control.send(MockGithubControl::Shutdown).unwrap();
+    let github_state = github_server.await.unwrap();
+    assert_eq!(github_state.threads.len(), 1);
+    assert!(github_state.threads[0].is_resolved);
+    assert_eq!(
+        github_state
+            .requests
+            .iter()
+            .filter(|request| request.body["query"]
+                .as_str()
+                .is_some_and(|query| query.contains("resolveReviewThread")))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn d32_focused_resolution_pass_skips_when_budget_is_exhausted() {
+    let fixture = review_project_fixture();
+    let root = fixture.path();
+    let base_sha = "b".repeat(40);
+    let head_one = git_head(root);
+    let patch_one =
+        "@@ -0,0 +1,3 @@\n+pub fn calculate() {\n+    calculate_transaction_total();\n+}\n";
+    let (github_url, github_server, control) = mock_github_server(
+        base_sha.clone(),
+        head_one.clone(),
+        patch_one.to_owned(),
+        None,
+    )
+    .await;
+    let finding = review_finding();
+    let responses = vec![
+        deepseek_review_response(review_report(
+            "The balance check is missing.",
+            Some(&finding),
+            Vec::new(),
+        )),
+        deepseek_review_response(review_report(
+            "The changed code contains no finding.",
+            None,
+            Vec::new(),
+        )),
+    ];
+    let (deepseek_url, deepseek_server) = scripted_http(responses).await;
+    let runner = ReviewRunner::new(
+        GitHubClient::new(github_url, "synthetic-github-token".to_owned()).unwrap(),
+        DeepSeekClient::new(
+            deepseek_url,
+            "synthetic-deepseek-key".to_owned(),
+            "deepseek-flash".to_owned(),
+        )
+        .unwrap(),
+    );
+    let identity_one = PullRequestId {
+        owner: "acme".to_owned(),
+        repository: "transaction-import".to_owned(),
+        number: 7,
+        expected_base_sha: base_sha,
+        expected_head_sha: head_one,
+    };
+    let cache = root.join(".data/focused-resolution-exhausted/index");
+    let mut index = ReviewIndex::open(root, &cache, FixtureEmbedder::default())
+        .expect("initial synthetic corpus indexes");
+    let first = runner
+        .run_with_index(root, &identity_one, 300, &mut index)
+        .await
+        .expect("initial review creates the prior finding");
+    assert_eq!(first.threads_created_or_updated, 1);
+
+    write_text(
+        root,
+        "src/transaction.rs",
+        "pub fn calculate() {\n    if !validate_transaction_balance() {\n        return;\n    }\n    calculate_transaction_total();\n}\n",
+    );
+    let head_two = commit_fixture(root, "add balance guard at exhausted budget");
+    let patch_two = "@@ -1,3 +1,6 @@\n pub fn calculate() {\n+    if !validate_transaction_balance() {\n+        return;\n+    }\n     calculate_transaction_total();\n }\n";
+    set_mock_snapshot(&control, head_two.clone(), patch_two.to_owned()).await;
+    drop(index);
+    let mut index = ReviewIndex::open(root, &cache, FixtureEmbedder::default())
+        .expect("updated synthetic corpus reindexes");
+    let identity_two = PullRequestId {
+        expected_head_sha: head_two,
+        ..identity_one
+    };
+    let second = runner
+        .run_with_index(root, &identity_two, 300, &mut index)
+        .await
+        .expect("exhausted budget skips the focused provider request");
+    assert_eq!(second.threads_resolved, 0);
+    assert_eq!(second.focused_resolution_usage, None);
+    assert_eq!(second.retrieval_uncached_input_tokens, 300);
+    assert_eq!(second.budgeted_uncached_input_tokens, 300);
+    assert_eq!(second.requests, 1);
+
+    let deepseek_requests = deepseek_server
+        .await
+        .expect("provider receives only the two main review requests");
+    assert_eq!(deepseek_requests.len(), 2);
     control.send(MockGithubControl::Shutdown).unwrap();
     let github_state = github_server.await.unwrap();
     assert_eq!(github_state.threads.len(), 1);

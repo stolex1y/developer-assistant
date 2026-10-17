@@ -160,10 +160,25 @@ async fn run_review(
         result.threads_created_or_updated,
         result.threads_resolved
     );
+    let focused_uncached = result
+        .focused_resolution_usage
+        .as_ref()
+        .map_or(0, |usage| usage.uncached_input_tokens);
     println!(
-        "Tool-enabled uncached input tokens: {}; tool calls: {}; provider requests: {}.",
-        result.retrieval_uncached_input_tokens, result.tool_calls_executed, result.requests
+        "Budgeted uncached input tokens: {}/{} (tool-enabled retrieval: {}, focused resolution: {}). Tool calls: {}; provider requests: {}.",
+        result.budgeted_uncached_input_tokens,
+        max_uncached_input_tokens,
+        result.retrieval_uncached_input_tokens,
+        focused_uncached,
+        result.tool_calls_executed,
+        result.requests
     );
+    if let Some(usage) = result.focused_resolution_usage {
+        println!(
+            "Focused no-tools request usage (counted in budget): prompt={}, cached={}, uncached={}.",
+            usage.prompt_tokens, usage.cached_input_tokens, usage.uncached_input_tokens
+        );
+    }
     if let Some(usage) = result.final_usage {
         println!(
             "Final no-tools request usage (separate): prompt={}, cached={}, uncached={}.",

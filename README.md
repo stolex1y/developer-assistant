@@ -183,16 +183,18 @@ Ollama, PyTorch, daemon и GPU не нужны. Actions cache хранит Cargo
 Скомпилированный `target/` не кэшируется. При первом запуске runner скачивает
 зависимости и веса; для этого требуется доступ к crates.io и Hugging Face.
 
-DeepSeek получает только допустимый PR diff, отобранные passages и краткие
+DeepSeek получает только допустимый PR diff, выбранные passages и краткие
 предыдущие findings. Полный индекс, credentials и посторонние файлы не
-отправляются. По умолчанию caller задаёт лимит 30 000 uncached input tokens для
-tool-enabled запросов; usage финального запроса без tools показывается отдельно.
-Изменить лимит можно в `with.max_uncached_input_tokens` caller workflow.
-Для учёта нужны `prompt_tokens` и хотя бы один cache counter. Если provider
-возвращает `prompt_cache_miss_tokens`, используется он; иначе uncached count
-вычисляется как `prompt_tokens - cache-hit count` (`prompt_cache_hit_tokens` или
-`cached_tokens`). Отсутствие обоих counters или противоречивые значения
-останавливают review без публикации.
+отправляются. Лимит 30 000 uncached input tokens суммирует tool-enabled retrieval
+requests и отдельный focused resolution request. Последний запускается только для
+безопасных прежних findings на изменённых путях с added-side evidence и
+пропускается, если budget уже исчерпан. Usage финального no-tools request после
+исчерпания retrieval budget показывается отдельно и в лимит не входит. Изменить
+лимит можно в `with.max_uncached_input_tokens` caller workflow. Для учёта нужны
+`prompt_tokens` и хотя бы один cache counter. Если provider возвращает
+`prompt_cache_miss_tokens`, используется он; иначе uncached count вычисляется как
+`prompt_tokens - cache-hit count` (`prompt_cache_hit_tokens` или `cached_tokens`).
+Отсутствие обоих counters или противоречивые значения останавливают review.
 
 В целевом GitHub repository задайте Actions secret `DEEPSEEK_API_KEY`.
 `GITHUB_TOKEN` workflow получает автоматически с `contents: write` и
@@ -209,13 +211,14 @@ diff. Для добавленных/изменённых файлов evidence �
 последствие удаления, а не текущее содержимое. Такие findings не получают inline
 anchor; renderer запрещает публиковать их inline.
 
-Активные прежние findings, чьи comment bodies не содержат secret-like values,
-передаются модели для отдельной оценки; сами комментарии с такими values намеренно
-не отправляются в provider context. Для included findings модель предлагает
-resolution с точным added-side evidence, если issue исправлен, или подтверждённый
-finding, если проблема сохраняется. Клиент независимо проверяет fingerprint/path,
-evidence в индексе и diff. Неподтверждённые findings исключаются и не блокируют
-другие подтверждённые findings или resolutions.
+Активные прежние findings с безопасными comment bodies передаются основному
+review; bodies с secret-like values остаются локально. Если основной response не
+содержит проверенного resolution для safe finding на изменённом пути с
+added-side code, отдельный no-tools pass рассматривает только такие findings,
+изменённые additions и релевантные bounded RAG passages. Он возвращает только
+`resolved_findings`. Клиент независимо проверяет fingerprint/path и точное
+evidence в индексе и added-side diff; непроверенные candidates не закрывают
+threads и не блокируют другие подтверждённые findings или resolutions.
 
 Краткое AI-резюме не проверяется отдельно. У findings сверяются path/evidence с diff;
 смысл замечаний требует ручной оценки.

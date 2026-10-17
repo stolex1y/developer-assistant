@@ -7,6 +7,7 @@ use std::collections::HashSet;
 pub const SUMMARY_MARKER: &str = "<!-- developer-assistant:summary:v1 -->";
 const FINDING_MARKER_PREFIX: &str = "<!-- developer-assistant:finding:v1:";
 const MAX_FINDINGS: usize = 32;
+const MAX_RESOLVED_FINDINGS: usize = 100;
 const MAX_SUMMARY_BYTES: usize = 8 * 1024;
 const MAX_RENDERED_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_DETAIL_BYTES: usize = 2 * 1024;
@@ -51,6 +52,16 @@ pub struct ResolvedFinding {
     pub evidence: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolutionReport {
+    pub resolved_findings: Vec<ResolvedFinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolutionReportEnvelope {
+    resolved_findings: Vec<serde_json::Value>,
+}
 impl ReviewReport {
     pub fn parse(content: &str) -> Result<Self> {
         let report: Self = serde_json::from_str(content)
@@ -87,24 +98,57 @@ impl ReviewReport {
             }
         }
 
-        if self.resolved_findings.len() > 100 {
-            bail!("DeepSeek вернул слишком много resolved findings.");
-        }
-        let mut resolved_fingerprints = HashSet::with_capacity(self.resolved_findings.len());
-        for resolved in &self.resolved_findings {
-            validate_fingerprint(&resolved.fingerprint)?;
-            if !resolved_fingerprints.insert(resolved.fingerprint.as_str()) {
-                bail!("DeepSeek вернул повторяющийся resolved fingerprint.");
-            }
-            validate_text(&resolved.path, 1024, "resolved finding path")?;
-            validate_text(
-                &resolved.evidence,
-                MAX_EVIDENCE_BYTES,
-                "resolution evidence",
-            )?;
-        }
-        Ok(())
+        validate_resolved_findings(&self.resolved_findings)
     }
+}
+
+impl ResolutionReport {
+    pub fn parse(content: &str) -> Result<Self> {
+        let envelope: ResolutionReportEnvelope = serde_json::from_str(content)
+            .context("DeepSeek focused resolution JSON не соответствует report contract.")?;
+        let capacity = envelope.resolved_findings.len().min(MAX_RESOLVED_FINDINGS);
+        let mut seen = HashSet::with_capacity(capacity);
+        let mut resolved_findings = Vec::with_capacity(capacity);
+        for value in envelope.resolved_findings {
+            let Ok(candidate) = serde_json::from_value::<ResolvedFinding>(value) else {
+                continue;
+            };
+            if validate_resolved_finding(&candidate).is_err()
+                || !seen.insert(candidate.fingerprint.clone())
+            {
+                continue;
+            }
+            resolved_findings.push(candidate);
+            if resolved_findings.len() == MAX_RESOLVED_FINDINGS {
+                break;
+            }
+        }
+        Ok(Self { resolved_findings })
+    }
+}
+
+fn validate_resolved_findings(resolved_findings: &[ResolvedFinding]) -> Result<()> {
+    if resolved_findings.len() > MAX_RESOLVED_FINDINGS {
+        bail!("DeepSeek вернул слишком много resolved findings.");
+    }
+    let mut fingerprints = HashSet::with_capacity(resolved_findings.len());
+    for resolved in resolved_findings {
+        validate_resolved_finding(resolved)?;
+        if !fingerprints.insert(resolved.fingerprint.as_str()) {
+            bail!("DeepSeek вернул повторяющийся resolved fingerprint.");
+        }
+    }
+    Ok(())
+}
+
+fn validate_resolved_finding(resolved: &ResolvedFinding) -> Result<()> {
+    validate_fingerprint(&resolved.fingerprint)?;
+    validate_text(&resolved.path, 1024, "resolved finding path")?;
+    validate_text(
+        &resolved.evidence,
+        MAX_EVIDENCE_BYTES,
+        "resolution evidence",
+    )
 }
 
 impl FindingCategory {
