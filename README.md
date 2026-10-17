@@ -194,11 +194,15 @@ tool-enabled запросов; usage финального запроса без 
 `cached_tokens`). Отсутствие обоих counters или противоречивые значения
 останавливают review без публикации.
 
+`finish_reason=length` или невалидный JSON/report contract останавливает review
+до GitHub writes; автоматической повторной генерации нет. Parse diagnostics
+сообщают только безопасную категорию serde-ошибки и позицию, без raw provider output.
+
 В целевом GitHub repository задайте Actions secret `DEEPSEEK_API_KEY`.
-`GITHUB_TOKEN` workflow получает автоматически с `contents: write` и
-`pull-requests: write`: первое разрешение даёт job техническую возможность менять
-содержимое репозитория, второе требуется для PR comments и разрешения review threads.
-Утилита сама не выполняет commit, push или merge.
+`GITHUB_TOKEN` workflow получает автоматически с `contents: read` и
+`pull-requests: write`: первое разрешение нужно для checkout и чтения исходников,
+второе — для PR summary, inline comments и разрешения review threads. Утилита
+сама не выполняет commit, push или merge.
 Workflow запускается при `opened`, `reopened` и `synchronize`; результат — PR summary
 и обновляемые inline threads.
 
