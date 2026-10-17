@@ -1,5 +1,5 @@
 use crate::{
-    assistant::{escape_terminal_field, escape_terminal_text},
+    assistant::{escape_terminal_field, escape_terminal_text, render_markdown_response},
     config::UserConfig,
     provider::{self, ToolExecutor, ToolLoopResult},
     task_files::TaskWorkspace,
@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::Path,
 };
 
@@ -70,7 +70,10 @@ pub async fn run_task_with_confirmation(
     mut confirm: impl FnMut(&str) -> Result<Option<String>>,
 ) -> Result<()> {
     let mut result = prepare_task(root, goal, config, selected_model).await?;
-    println!("Резюме:\n{}", escape_terminal_text(&result.usage.content));
+    println!(
+        "Резюме:\n{}",
+        render_markdown_response(&result.usage.content)
+    );
     println!("Прочитанные файлы:");
     for path in result.workspace.read_paths() {
         println!("- {}", escape_terminal_field(&path));
@@ -84,10 +87,12 @@ pub async fn run_task_with_confirmation(
     for path in &paths {
         println!("- {}", escape_terminal_field(path));
     }
-    println!(
-        "Unified diff (ещё не применён):\n{}",
-        escape_terminal_text(&result.workspace.diff()?)
-    );
+    println!("Unified diff (ещё не применён):");
+    print_diff(
+        &mut io::stdout().lock(),
+        &result.workspace.diff()?,
+        io::stdout().is_terminal(),
+    )?;
     io::stdout().flush()?;
     let answer = confirm("Применить показанные изменения? Введите yes или да: ")?;
     if !confirmation_is_yes(answer.as_deref()) {
@@ -98,6 +103,35 @@ pub async fn run_task_with_confirmation(
     println!("Применены файлы:");
     for path in applied {
         println!("- {}", escape_terminal_field(&path));
+    }
+    Ok(())
+}
+
+fn print_diff(output: &mut impl Write, diff: &str, color: bool) -> io::Result<()> {
+    let safe = escape_terminal_text(diff);
+    for line in safe.split_inclusive('\n') {
+        let style = if line.starts_with("diff --git ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+        {
+            "\x1b[1;36m"
+        } else if line.starts_with("@@") {
+            "\x1b[36m"
+        } else if line.starts_with('+') {
+            "\x1b[32m"
+        } else if line.starts_with('-') {
+            "\x1b[31m"
+        } else {
+            ""
+        };
+        if color && !style.is_empty() {
+            write!(output, "{style}{}\x1b[0m", line.trim_end_matches('\n'))?;
+            if line.ends_with('\n') {
+                writeln!(output)?;
+            }
+        } else {
+            write!(output, "{line}")?;
+        }
     }
     Ok(())
 }

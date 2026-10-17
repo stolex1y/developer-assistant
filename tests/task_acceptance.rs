@@ -468,3 +468,43 @@ async fn model_can_verify_staged_content_by_rereading_same_range() {
     assert_eq!(read["path"], "docs/api.md");
     assert_eq!(read["content"], NEW_DOC);
 }
+
+#[tokio::test]
+async fn task_summary_renders_markdown_and_redirected_diff_has_no_ansi() {
+    let temp = project();
+    let mut script = discovery();
+    script.push(response(vec![(
+        "propose_file",
+        json!({"path":"docs/api.md","content":NEW_DOC}),
+    )]));
+    script.push(response(vec![]));
+    script.last_mut().unwrap()["choices"][0]["message"]["content"] = json!(
+        "# Результат\n\n**Документация** проверена.\n\n- Endpoint: `/imports`\n\n```rust\nImportApi::ENDPOINT\n```"
+    );
+    let (output, _) = invoke(
+        temp.path(),
+        script,
+        "no\n",
+        "Обнови документацию API",
+        false,
+        None,
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Документация"));
+    assert!(stdout.contains("ImportApi::ENDPOINT"));
+    assert!(!stdout.contains("# Результат"));
+    assert!(!stdout.contains("**Документация**"));
+    assert!(!stdout.contains("```rust"));
+    assert!(!stdout.contains('\x1b'));
+    assert!(stdout.contains("-Endpoint: /old-import\n+Endpoint: /imports"));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("docs/api.md")).unwrap(),
+        OLD_DOC
+    );
+}

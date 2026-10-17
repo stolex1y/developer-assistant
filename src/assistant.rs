@@ -157,7 +157,7 @@ fn escape_terminal_controls(text: &str, preserve_newlines: bool) -> Cow<'_, str>
     Cow::Owned(escaped)
 }
 
-fn render_markdown_response(markdown: &str) -> String {
+pub(crate) fn render_markdown_response(markdown: &str) -> String {
     let width = terminal_size::terminal_size()
         .map(|(terminal_size::Width(width), _)| usize::from(width))
         .filter(|width| *width > 0)

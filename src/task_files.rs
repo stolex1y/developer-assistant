@@ -219,7 +219,7 @@ impl TaskWorkspace {
         self.exposed.iter().cloned().collect()
     }
 
-    /// A deterministic whole-file unified hunk; no external process receives proposed contents.
+    /// A deterministic in-memory unified diff with three lines of context.
     pub fn diff(&self) -> Result<String> {
         let mut result = String::new();
         for (path, new) in &self.staged {
@@ -232,35 +232,22 @@ impl TaskWorkspace {
             if !self.originals.contains_key(path) {
                 result.push_str("new file mode 100644\n");
             }
-            let old_lines = old.split_inclusive('\n').count();
-            let new_lines = new.split_inclusive('\n').count();
-            if old_lines == 0 && new_lines == 0 {
-                continue;
-            }
-            result.push_str(&format!(
-                "--- {}\n+++ b/{path}\n",
-                if self.originals.contains_key(path) {
-                    format!("a/{path}")
-                } else {
-                    "/dev/null".into()
-                }
-            ));
-            result.push_str(&format!(
-                "@@ -{},{} +{},{} @@\n",
-                usize::from(old_lines > 0),
-                old_lines,
-                usize::from(new_lines > 0),
-                new_lines
-            ));
-            for (prefix, text) in [('-', old), ('+', new.as_str())] {
-                for line in text.split_inclusive('\n') {
-                    result.push(prefix);
-                    result.push_str(line);
-                    if !line.ends_with('\n') {
-                        result.push_str("\n\\ No newline at end of file\n");
-                    }
-                }
-            }
+            let old_name = if self.originals.contains_key(path) {
+                format!("a/{path}")
+            } else {
+                "/dev/null".to_owned()
+            };
+            let new_name = format!("b/{path}");
+            let text_diff = similar::TextDiff::from_lines(old, new);
+            use std::fmt::Write as _;
+            write!(
+                result,
+                "{}",
+                text_diff
+                    .unified_diff()
+                    .context_radius(3)
+                    .header(&old_name, &new_name)
+            )?;
         }
         Ok(result)
     }
