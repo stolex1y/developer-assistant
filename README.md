@@ -166,9 +166,9 @@ tokens; после достижения лимита новые tools не ис�
   (Git modes `100644`/`100755`), без файлов под `.gitignore`, symlinks,
   generated/build/vendor-каталогов, minified/map/lock-файлов, secret-like paths,
   binary/NUL, non-UTF-8 и empty files. Лимит: 10 000 файлов; per-file и aggregate
-  source-byte caps отсутствуют. D31 держит corpus/index в памяти, поэтому RAM и
-  время растут с объёмом. D32 отдельно сохраняет 256 MiB предел serialized
-  embedding cache. Во время успешного `/help` причины пропусков и path examples
+  source-byte caps отсутствуют. `/help` держит corpus/index в памяти, поэтому RAM и
+  время растут с объёмом. PR review отдельно ограничивает размер serialized
+  embedding cache до 256 MiB. Во время успешного `/help` причины пропусков и path examples
   не печатаются; ошибки остаются видимыми. Фильтры и redaction — эвристики, не DLP.
 - Локальный BM25 работает по исходникам, тестам, README, docs, схемам и другим
   допустимым tracked text files; Markdown headings влияют на ранжирование, но
@@ -207,7 +207,7 @@ tokens; после достижения лимита новые tools не ис�
   tools. Его usage проверяется, показывается отдельно и не прибавляется к loop
   budget. Отсутствующие или противоречивые counters останавливают запрос без
   оценки токенов и fallback.
-- При этом token-only limit не ограничивает provider, который многократно возвращает новые tool calls с нулевыми uncached input tokens. Отдельного ограничения числа вызовов нет по согласованному контракту.
+- При этом token-only limit не ограничивает provider, который многократно возвращает новые tool calls с нулевыми uncached input tokens. Отдельного ограничения числа вызовов нет.
 - Перед выводом экранируются terminal controls и bidi-direction marks в ответе,
   Git branch, путях и source citations; переводы строк в ответе сохраняются.
 
@@ -254,10 +254,10 @@ tool-enabled запросов; usage финального запроса без 
 
 В целевом GitHub repository задайте Actions secret `DEEPSEEK_API_KEY`.
 `GITHUB_TOKEN` получает `contents: write` и `pull-requests: write` для разрешения
-исправленных review threads и публикации PR summary/inline comments. Это
-согласованный security tradeoff: write-доступ ограничен текущим PR workflow;
-утилита не выполняет commit, push или merge. Workflow запускается при `opened`,
-`reopened` и `synchronize`; результат — PR summary и обновляемые inline threads.
+исправленных review threads и публикации PR summary/inline comments. Эти
+разрешения дают write-доступ к репозиторию; утилита не выполняет commit, push
+или merge. Workflow запускается при `opened`, `reopened` и `synchronize`;
+результат — PR summary и обновляемые inline threads.
 
 В PR summary и inline comments попадают findings с path и evidence, подтверждёнными
 diff. Для добавленных/изменённых файлов evidence берётся из added/current-side. Для
@@ -294,9 +294,8 @@ same-repository PR, которому разрешено менять `.github/wo
 защищает секрет от злонамеренного редактора workflow. Fork PR не получают ключ
 и пропускаются; не предоставляйте write access недоверенным участникам.
 
-Перед реальным запуском опубликуйте utility commit и caller commit; caller
-должен ссылаться на опубликованный immutable SHA. Проверка без credentials и
-внешних API:
+Caller workflow должен ссылаться на опубликованный immutable SHA утилиты.
+Проверка review pipeline без credentials и внешних API:
 
 ```bash
 cargo test --locked --test review_acceptance
